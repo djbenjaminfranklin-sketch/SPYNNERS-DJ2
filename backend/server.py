@@ -75,10 +75,19 @@ messages_collection = db["messages"]
 playlists_collection = db["playlists"]
 recognition_history_collection = db["recognition_history"]
 
-# ACRCloud Configuration (to be set by user)
+# ACRCloud Configuration - OFFLINE (Spynners Catalog) - Primary
 ACRCLOUD_HOST = os.getenv("ACRCLOUD_HOST", "identify-eu-west-1.acrcloud.com")
 ACRCLOUD_ACCESS_KEY = os.getenv("ACRCLOUD_ACCESS_KEY", "")
 ACRCLOUD_ACCESS_SECRET = os.getenv("ACRCLOUD_ACCESS_SECRET", "")
+ACRCLOUD_BUCKET_ID = os.getenv("ACRCLOUD_BUCKET_ID", "")
+
+# ACRCloud Configuration - ONLINE (Global Catalog) - Fallback
+ACRCLOUD_ONLINE_ACCESS_KEY = os.getenv("ACRCLOUD_ONLINE_ACCESS_KEY", "")
+ACRCLOUD_ONLINE_ACCESS_SECRET = os.getenv("ACRCLOUD_ONLINE_ACCESS_SECRET", "")
+
+# Log loaded keys (masked for security)
+print(f"[ACRCloud Config] Primary Key: {ACRCLOUD_ACCESS_KEY[:8]}...{ACRCLOUD_ACCESS_KEY[-4:] if ACRCLOUD_ACCESS_KEY else 'NOT SET'}")
+print(f"[ACRCloud Config] Fallback Key: {ACRCLOUD_ONLINE_ACCESS_KEY[:8]}...{ACRCLOUD_ONLINE_ACCESS_KEY[-4:] if ACRCLOUD_ONLINE_ACCESS_KEY else 'NOT SET'}")
 
 # Google Places API
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
@@ -211,100 +220,12 @@ async def recognize_audio(request: AudioRecognitionRequest, authorization: Optio
         # Decode base64 audio
         audio_data = base64.b64decode(request.audio_base64)
         
-        # Detect audio format from magic bytes
-        audio_format = "audio/wav"  # Default
-        audio_extension = "wav"
-        needs_conversion = False
-        
-        # Check magic bytes for common formats
-        if audio_data[:4] == b'RIFF':
-            audio_format = "audio/wav"
-            audio_extension = "wav"
-        elif audio_data[:4] == b'\x1aE\xdf\xa3':  # WebM/Matroska
-            audio_format = "audio/webm"
-            audio_extension = "webm"
-            needs_conversion = True  # WebM needs conversion for better ACRCloud compatibility
-        elif audio_data[:4] == b'ftyp' or audio_data[4:8] == b'ftyp':  # MP4/M4A
-            audio_format = "audio/mp4"
-            audio_extension = "m4a"
-            needs_conversion = True  # M4A needs conversion
-        elif audio_data[:3] == b'ID3' or audio_data[:2] == b'\xff\xfb':  # MP3
-            audio_format = "audio/mpeg"
-            audio_extension = "mp3"
-        elif audio_data[:4] == b'OggS':  # OGG
-            audio_format = "audio/ogg"
-            audio_extension = "ogg"
-            needs_conversion = True  # OGG needs conversion
-        
-        print(f"[ACRCloud] Audio format detected: {audio_format} ({len(audio_data)} bytes)")
+        print(f"[ACRCloud] Received audio: {len(audio_data)} bytes")
         print(f"[ACRCloud] First 20 bytes (hex): {audio_data[:20].hex()}")
         
-        # Convert non-WAV formats to WAV for better ACRCloud compatibility
-        if needs_conversion:
-            print(f"[ACRCloud] Converting {audio_format} to WAV for better recognition...")
-            import subprocess
-            import tempfile
-            import os
-            
-            # Create temp files for conversion
-            with tempfile.NamedTemporaryFile(suffix=f'.{audio_extension}', delete=False) as input_file:
-                input_file.write(audio_data)
-                input_path = input_file.name
-            
-            output_path = input_path.replace(f'.{audio_extension}', '.wav')
-            
-            try:
-                # Convert to WAV using ffmpeg
-                # Use high quality settings for better fingerprinting
-                cmd = [
-                    'ffmpeg', '-y', '-i', input_path,
-                    '-ar', '44100',  # 44.1kHz sample rate
-                    '-ac', '1',      # Mono
-                    '-acodec', 'pcm_s16le',  # 16-bit PCM
-                    output_path
-                ]
-                print(f"[ACRCloud] Running conversion: {' '.join(cmd)}")
-                
-                result = subprocess.run(cmd, capture_output=True, timeout=30)
-                
-                print(f"[ACRCloud] ffmpeg return code: {result.returncode}")
-                if result.stderr:
-                    stderr_text = result.stderr.decode()
-                    print(f"[ACRCloud] ffmpeg stderr (last 500 chars): {stderr_text[-500:]}")
-                
-                if result.returncode == 0 and os.path.exists(output_path):
-                    with open(output_path, 'rb') as f:
-                        audio_data = f.read()
-                    audio_format = "audio/wav"
-                    audio_extension = "wav"
-                    print(f"[ACRCloud] Conversion successful! New size: {len(audio_data)} bytes")
-                    # Cleanup now that we have the data
-                    try:
-                        os.unlink(input_path)
-                        os.unlink(output_path)
-                    except:
-                        pass
-                else:
-                    error_output = result.stderr.decode()[-500:] if result.stderr else "No error message"
-                    print(f"[ACRCloud] Conversion failed. Return code: {result.returncode}")
-                    print(f"[ACRCloud] Error: {error_output}")
-                    # Cleanup input file only
-                    try:
-                        os.unlink(input_path)
-                    except:
-                        pass
-            except Exception as e:
-                print(f"[ACRCloud] Conversion error: {e}")
-                import traceback
-                traceback.print_exc()
-                # Cleanup on error
-                try:
-                    if os.path.exists(input_path):
-                        os.unlink(input_path)
-                    if os.path.exists(output_path):
-                        os.unlink(output_path)
-                except:
-                    pass
+        # Skip format detection and conversion - send raw audio as wav
+        # ACRCloud can handle various formats when sent with audio_format parameter
+        # This matches the working implementation from the website
         
         # ACRCloud API parameters
         http_method = "POST"
@@ -319,22 +240,25 @@ async def recognize_audio(request: AudioRecognitionRequest, authorization: Optio
             data_type, signature_version, timestamp, ACRCLOUD_ACCESS_SECRET
         )
         
-        # Prepare request - ACRCloud accepts various formats
-        # Use detected format instead of hardcoded wav
+        # Prepare request - Match the working implementation exactly
+        # Send as audio.wav with explicit parameters
         files = {
-            'sample': (f'audio.{audio_extension}', BytesIO(audio_data), audio_format)
+            'sample': ('audio.wav', BytesIO(audio_data), 'audio/wav')
         }
         
         data = {
             'access_key': ACRCLOUD_ACCESS_KEY,
-            'sample_bytes': len(audio_data),
+            'sample_bytes': str(len(audio_data)),
             'timestamp': timestamp,
             'signature': signature,
             'data_type': data_type,
-            'signature_version': signature_version
+            'signature_version': signature_version,
+            'sample_rate': '48000',
+            'audio_format': 'wav'
         }
         
-        print(f"[ACRCloud] Sending {len(audio_data)} bytes as {audio_format} to ACRCloud...")
+        print(f"[ACRCloud] Sending {len(audio_data)} bytes to ACRCloud...")
+        print(f"[ACRCloud] Using key: {ACRCLOUD_ACCESS_KEY[:8]}...{ACRCLOUD_ACCESS_KEY[-4:]}")
         
         # Send to ACRCloud
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -832,9 +756,15 @@ async def concatenate_audio(request: ConcatenateAudioRequest):
             # Output file
             output_path = os.path.join(temp_dir, f"concatenated.{request.output_format}")
             
+            # Find ffmpeg - try multiple paths
+            ffmpeg_path = '/usr/bin/ffmpeg'
+            if not os.path.exists(ffmpeg_path):
+                import shutil
+                ffmpeg_path = shutil.which('ffmpeg') or 'ffmpeg'
+            
             # Run ffmpeg concatenation
             cmd = [
-                'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', concat_file_path,
+                ffmpeg_path, '-y', '-f', 'concat', '-safe', '0', '-i', concat_file_path,
                 '-c', 'copy',  # Copy streams without re-encoding for speed
                 output_path
             ]
@@ -3623,7 +3553,7 @@ async def get_admin_tracks(authorization: str = Header(None), status: str = None
             all_tracks = [t for t in all_tracks if t.get('status', '').lower() == status.lower()]
         
         # Transform relative URLs to full URLs for audio_url
-        backend_base_url = os.environ.get('BACKEND_URL', 'https://spyndevs.preview.emergentagent.com')
+        backend_base_url = os.environ.get('BACKEND_URL', 'https://app-recovery-spyn.preview.emergentagent.com')
         for track in all_tracks:
             audio_url = track.get('audio_url')
             if audio_url and audio_url.startswith('/api/'):
@@ -4691,9 +4621,9 @@ async def export_admin_downloads_pdf(request: AdminDownloadsPDFRequest, authoriz
                             print(f"[Admin Downloads PDF] Date parse error for track {track.get('title')}: {e}")
                             pass
                     elif not track_date and (request.start_date or request.end_date):
-                        # No date on track but filter is set - exclude
+                        # Track has no date but filter is set - EXCLUDE (can't verify date range)
                         include = False
-                        print(f"[Admin Downloads PDF] Track excluded (no date): {track.get('title')}")
+                        print(f"[Admin Downloads PDF] Track excluded (no date, filter active): {track.get('title')}")
                     
                     if include:
                         downloads.append({
@@ -5417,7 +5347,7 @@ async def upload_vip_track(
                 
                 # Create full URL for the file - use the preview URL for the backend
                 # This will be accessible from the app
-                backend_base_url = os.environ.get('BACKEND_URL', 'https://spyndevs.preview.emergentagent.com')
+                backend_base_url = os.environ.get('BACKEND_URL', 'https://app-recovery-spyn.preview.emergentagent.com')
                 audio_url = f"{backend_base_url}/api/uploads/{unique_filename}"
                 print(f"[Admin VIP Upload] Audio saved locally: {audio_url}")
             

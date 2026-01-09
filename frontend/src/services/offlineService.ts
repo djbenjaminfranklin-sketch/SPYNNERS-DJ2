@@ -38,7 +38,7 @@ const getBackendUrl = () => {
   }
   
   // Fallback
-  return 'https://app-recovery-spyn.preview.emergentagent.com';
+  return 'https://songtrack-1.preview.emergentagent.com';
 };
 
 const BACKEND_URL = getBackendUrl();

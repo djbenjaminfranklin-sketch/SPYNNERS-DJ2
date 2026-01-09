@@ -57,7 +57,7 @@ const getBackendUrl = () => {
   if (Platform.OS === 'web' && typeof window !== 'undefined') {
     return window.location.origin;
   }
-  return 'https://app-recovery-spyn.preview.emergentagent.com';
+  return 'https://songtrack-1.preview.emergentagent.com';
 };
 const BACKEND_URL = getBackendUrl();
 

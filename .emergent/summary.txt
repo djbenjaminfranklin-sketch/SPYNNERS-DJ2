@@ -1,158 +1,338 @@
 <analysis>
-**original_problem_statement**: The initial problem statement from the previous fork focused on translating the entire application from hardcoded French to an internationalization (i18n) system with English as the default language, while also addressing a long list of critical bugs.
 
-During this session, the user added several new requests:
-1.  Add three new static pages: Legal (), Terms of Use (), and FAQ, with content scraped from the main website.
-2.  Restore the notification bell feature, which was missing from the UI, and ensure it was functional.
-3.  Fix a crash that occurred when playing a track from the .
-4.  Fix a critical regression where purchased VIP tracks became locked again after re-logging in.
-5.  Remove the Buy More button from the VIP page.
-6.  Once all development was complete, provide guidance on how to perform the final application build for the app stores.
+**original_problem_statement:**
+The user's goal is to finalize a stable iOS application for production. The session focused on fixing a comprehensive list of bugs reported by the user after a previous architectural migration. The bugs spanned UI issues, feature malfunctions, performance problems, and a native crash on the latest build.
+
+The user's most recent bug reports include:
+1.  **Native Build Crash**: The latest iOS build (28) crashes immediately on startup.
+2.  **Screen Lock Issues**:
+    *   SPYN detection goes into offline mode when the screen is locked.
+    *   SPYN Record stops identifying tracks when the screen is locked.
+3.  **UI & UX Bugs**:
+    *   The header logo position is not correct.
+    *   The received tracks page shows a badge count of 0 even when tracks are present.
+4.  **Feature Bugs**:
+    *   The PDF export on the Download page ignores the selected date range and exports all tracks.
+    *   Internal track sending does not trigger a push notification (no sound/badge).
+    *   The Admin reject button was causing an error (status unverified).
+    *   The Admin VIP page was not showing tracks (status unverified).
+    *   SPYN Record was creating incomplete recordings (status unverified).
 
 **User's preferred language**: Français (French). The next agent MUST respond in French.
 
 **what currently exists?**
-The application is in a stable, feature-complete state according to the user. All hardcoded French strings have been successfully migrated to the i18n system (), making the app fully bilingual with English as the default. All new user requests from this session have been implemented: the three new legal/FAQ pages were created and linked, the notification system was restored and fixed, the VIP purchase regression was resolved, and minor UI cleanup was performed. The user has been guided through the process of exporting the code and running An Expo user account is required to proceed.
-
-Log in to EAS with email or username (exit and run eas login --help to see other login options)
-Input is required, but stdin is not readable. Failed to display prompt: Email or username on their local machine, and they have successfully generated the final  and  binaries.
+The application code contains numerous fixes for a long list of bugs. A native iOS build (build #28) was created but crashes on launch. The agent diagnosed the crash as a probable issue with a recently added  listener, which was then removed from the code. The project is currently in a non-functional state on TestFlight, awaiting a new build to verify the crash fix. The local Expo environment is functional but cannot replicate the native crash.
 
 **Last working item**:
--   Last item agent was working: The agent's final task was providing post-development support, guiding the user through troubleshooting and successfully running the An Expo user account is required to proceed.
+-   Last item agent was working: Fixing the native iOS app crash on startup (Build 28). The agent analyzed the user-provided crash log, which pointed to a  error in the Hermes JavaScript engine's garbage collector, likely triggered during module initialization. The agent hypothesized that the recently added  listener in  was the cause.
+-   Status: IN PROGRESS
+-   Agent Testing Done: N (The fix has been applied to the code, but a new native build is required to test it).
+-   Which testing method agent to use? The agent must guide the user to create a new iOS build using EAS (An Expo user account is required to proceed.
 
 Log in to EAS with email or username (exit and run eas login --help to see other login options)
-Input is required, but stdin is not readable. Failed to display prompt: Email or username command on their local computer to generate the production binaries. The last code change made was removing the Buy More button from the VIP page.
--   Status: **COMPLETED** (The user confirmed all work was done, asked to finish, and successfully built the app.)
--   Agent Testing Done: Y
--   Which testing method agent to use? NA (The user has declared the work complete and has built the final binaries).
--   User Testing Done: Y
+Input is required, but stdin is not readable. Failed to display prompt: Email or username) and then test it on TestFlight.
+-   User Testing Done: N
 
 **All Pending/In progress Issue list**:
-There are no pending or in-progress issues. The user has approved all work and considers the project finished. However, there is a high-risk recurring issue that should be monitored.
+-   **Issue 1: Native iOS App Crashes on Startup (P0)**
+    -   Description: The latest build (#28) crashes immediately upon opening on a real device. The crash log indicates a  error in the Hermes engine (garbage collection) during the initialization of a TurboModule.
+    -   Attempted fixes: The agent identified the  listener, added in  to handle app foregrounding, as the most likely culprit. This listener has been removed from the code.
+    -   Next debug checklist:
+        1.  Confirm with the user that the iOS build number in  should be incremented to **29**.
+        2.  Guide the user to generate a new iOS build via EAS.
+        3.  Ask the user to install the new build via TestFlight and confirm if the app launches without crashing.
+    -   Status: IN PROGRESS
+    -   Is recurring issue?: N
+    -   Should Test frontend/backend/both after fix?: Frontend (requires a new native iOS build).
+    -   Blocked on other issue: None. This is the highest priority blocker.
 
-**Issues Detail:**
--   **Issue 1: VIP Purchase Persistence Bug (P1 - High Risk of Recurrence)**
-    -   **Description**: A bug where tracks purchased in the VIP zone become locked again after an app restart. This is a recurring issue that was fixed in a previous session and resurfaced in this one.
-    -   **Attempted fixes**: The agent identified that the  function in  was incorrectly using  (which points directly to the Base44 BaaS) for calls on mobile, instead of  (which points to the application's local backend proxy). The fix was to change the call to use , which correctly routes the request through the local server. The user confirmed this fixed the issue.
-    -   **Next debug checklist**: If this bug recurs, immediately inspect . The root cause is almost always an incorrect API instance ( vs. ) being used for a specific platform (web vs. mobile). Ensure all calls to custom backend endpoints (prefixed with ) use .
-    -   **Why fix this issue and what will be achieved with the fix?**: This is critical for the app's monetization and user experience.
-    -   **Status**: RESOLVED
-    -   **Is recurring issue?**: Y
-    -   **Should Test frontend/backend/both after fix?**: Both.
-    -   **Blocked on other issue**: None.
+-   **Issue 2: SPYN/SPYN Record Stops Working on Screen Lock (P1)**
+    -   Description: Despite implementing , if the user manually locks the screen, SPYN detection incorrectly enters offline mode, and SPYN Record stops identifying new tracks. This is a known iOS limitation where network/CPU activity is suspended.
+    -   Attempted fixes:
+        1.   was added to prevent the screen from sleeping automatically.
+        2.  An  was added to warn the user not to lock the screen.
+        3.  The agent attempted to disable the app's internal offline mode logic, but this did not solve the underlying OS-level suspension.
+    -   Next debug checklist:
+        1.  Once a stable build is running, verify the current behavior with the user.
+        2.  If the issue persists and is a major problem for the user, investigate  or a dedicated background audio mode configuration to allow for true background processing.
+    -   Status: NOT STARTED
+    -   Is recurring issue?: Y
+    -   Should Test frontend/backend/both after fix?: Frontend (requires native build).
+
+-   **Issue 3: Download Page PDF Export Ignores Date Filter (P2)**
+    -   Description: When the user selects a date range on the admin download page and exports a PDF, the resulting file contains all tracks from the entire year, not just the selected period.
+    -   Attempted fixes: The agent modified the logic in  multiple times. The last fix (in ) aimed to correctly exclude tracks that are outside the specified  and  range. This fix has not been verified by the user.
+    -   Next debug checklist:
+        1.  Restart the backend service to ensure the latest Python code is running.
+        2.  Ask the user to test the PDF export with a specific, narrow date range.
+        3.  If it fails, review the filtering logic in the  route in  again, paying close attention to how  is handled when it's null or when a date range is provided.
+    -   Status: USER VERIFICATION PENDING
+    -   Is recurring issue?: Y
+    -   Should Test frontend/backend/both after fix?: Backend.
+
+-   **Issue 4: Received Tracks Badge Shows 0 (P2)**
+    -   Description: The user receives tracks sent internally by other members, and they appear on the received page, but the tab bar badge (or a counter on the page) incorrectly shows 0.
+    -   Attempted fixes: None. The agent identified the UI, but did not implement a fix for the counter logic.
+    -   Next debug checklist:
+        1.  Investigate where the badge count is calculated. This is likely in  or related to the data fetched in .
+        2.  The logic should count the number of received tracks ( entities) where .
+        3.  Correct the state management to update the badge count when new tracks are received or when they are viewed.
+    -   Status: NOT STARTED
+    -   Is recurring issue?: N
+    -   Should Test frontend/backend/both after fix?: Frontend.
+
+-   **Issue 5: Push Notifications Have No Sound/Badge (P2)**
+    -   Description: When a track is received, the push notification arrives but without making a sound or incrementing the app icon badge.
+    -   Attempted fixes: The agent previously configured  in  with  and . This is presumed to be correct but requires a native build to test.
+    -   Next debug checklist: This is blocked by the startup crash. Once a stable build is available, ask the user to test receiving a track and observe the notification behavior.
+    -   Status: USER VERIFICATION PENDING
+    -   Is recurring issue?: Y
+    -   Should Test frontend/backend/both after fix?: Frontend (requires native build).
 
 **In progress Task List**:
--   None.
+-   **Task 1: Generate a Stable iOS Build (P0)**
+    -   Where to resume: The agent has removed the suspected crashing code. The next step is to update the build number to 29 in  and guide the user through the An Expo user account is required to proceed.
+
+Log in to EAS with email or username (exit and run eas login --help to see other login options)
+Input is required, but stdin is not readable. Failed to display prompt: Email or username process.
+    -   What will be achieved with this? A usable TestFlight application that can be used to verify the numerous bug fixes implemented in this session.
+    -   Status: IN PROGRESS
+    -   Should Test frontend/backend/both after fix?: Frontend (manual test on TestFlight).
+    -   Blocked on something: User action is required to run the build command.
 
 **Upcoming and Future Tasks**
--   **Future Tasks**:
-    -   P2: Investigate the Black Diamond data discrepancy. A user from a previous session reported sessions showing multiple diamonds awarded, contrary to the one per day rule. This was never investigated. The logic around the  field in the  entity and any server-side logic that grants it should be checked.
+-   **Full test of External Microphone (P2)**: The original problem statement mentioned issues with external microphone detection in SPYN Record. This has not been addressed and requires a native build and the user's specific hardware (Pioneer V10) to test.
+-   **General App Slowness (P3)**: This was on the initial list but was not deeply investigated. Once the app is stable, performance profiling should be done to identify and optimize slow screens or data-loading operations.
 
 **Completed work in this session**
--   **Full Application Translation**: Migrated all hardcoded French strings across ~20 files to the i18n system in , setting English as the default language.
--   **Notification System Restoration & Fix**:
-    -   Made the notification bell icon visible in the  header.
-    -   Fixed the  styling to display correctly as a bottom sheet on mobile.
-    -   Ensured all 6 notification categories display correctly.
--   **New Content Pages**:
-    -   Created , , and  in .
-    -   Scraped content from the user's website to populate these pages.
-    -   Added links to these pages in the user's profile screen ().
--   **VIP Zone Bug Fixes**:
-    -   **Resolved Regression**: Fixed the critical bug where purchased VIP tracks would re-lock by correcting the API call in .
-    -   **UI Cleanup**: Removed the Buy More button from the  page.
--   **Player Bug Fix**: Fixed a crash in  by adding a missing  hook import.
--   **Build Support**: Guided the user through the local An Expo user account is required to proceed.
-
-Log in to EAS with email or username (exit and run eas login --help to see other login options)
-Input is required, but stdin is not readable. Failed to display prompt: Email or username process, including troubleshooting a dependency issue.
+-   **Build Crash**: Diagnosed a native startup crash from a crash log and implemented a potential fix by removing the  listener in .
+-   **Track Sending**: Rearchitected internal track sending to use a new  entity, mirroring the website's functionality. This involved modifying ,  (sending logic), and  (receiving logic).
+-   **UI Fixes**:
+    -   Adjusted the header logo position multiple times based on user feedback.
+    -   Added the current location display to the main recording screen of SPYN Record, not just the end-of-session modal.
+-   **Bug Fixes (Verified by User)**:
+    -   Home page filtering logic was stabilized using a  hook, resolving an issue where filters required multiple taps.
+-   **Bug Fixes (Implemented, Awaiting Verification)**:
+    -   **Screen Lock**: Implemented  and an alert to mitigate issues with the screen locking during sessions.
+    -   **Admin VIP Crash**: Fixed an initial crash by adding the  hook in .
+    -   **Track Details**: Improved logic in  and  to handle cases where a recognized track returns an empty title.
+    -   **Download Page**: Corrected translation key for the download button.
+    -   **Black Diamond**: Made the logic for awarding Black Diamonds stricter by adding a list of excluded venue types (, etc.) in  and .
+    -   **SPYN Record Recording**: Installed  on the backend and hardcoded the binary path in  to fix incomplete recordings.
 
 **Earlier issues found/mentioned but not fixed**
--   **Issue 1: Black Diamond data discrepancy**
-    -   **Debug checklist**: A user from a previous session reported sessions showing multiple diamonds awarded, contrary to the one per day rule. This was never investigated. The agent should check the logic around the  field in the  entity and any server-side logic that grants it in  or .
-    -   **Why to solve this issue and what will be achieved with this?**: Ensures the core reward mechanism of the app is functioning as designed.
-    -   **Should Test frontend/backend/both after fix**: Both.
-    -   **Is recurring issue?**: N
-
-**Known issue recurrence from previous fork**
--   **Issue recurrence in previous fork**: VIP Zone Purchase Persistence.
--   **Recurrence count**: 2 (Fixed in a previous fork, and fixed again in this session).
--   **Status**: RESOLVED. The agent fixed the root cause by correcting the API instance used in  for mobile calls. This is a critical point of failure to watch in the future.
+- All known pending issues are captured in the All Pending/In progress Issue list section. No known issues were completely missed.
 
 **Code Architecture**
-
+/api/admin/downloads/pdfTrackSendexpo-keep-awakeexpo-keep-awakeuseLanguageTrackSendAppStatebuildNumberautoIncrement
 
 **Key Technical Concepts**
--   **Internationalization (i18n)**: The core task. The entire app was refactored to use a React Context () for bilingual (EN/FR) support.
--   **Platform-Specific API Routing**: The VIP bug was a classic example of this project's recurring issue: using the wrong API instance ( vs. ) for mobile, leading to requests hitting the wrong server.
--   **UI/UX Debugging**: Fixed the  which was a combination of state initialization and platform-specific styling issues. It was corrected to a bottom sheet style for a better mobile experience.
--   **Code Scraping**: Used web scraping to pull content from the user's live website to populate the new static pages.
+-   **Native iOS Crash Debugging**: Analyzed a user-provided  crash log to identify a  error in the Hermes engine, pointing to an issue in the JS layer at startup.
+-   **EAS Build Process**: Encountered and troubleshooted several common build issues, including build number conflicts (), local environment corruption (env: load .env
+env: export EXPO_TUNNEL_SUBDOMAIN EXPO_PACKAGER_HOSTNAME EXPO_PUBLIC_BACKEND_URL EXPO_USE_FAST_RESOLVER METRO_CACHE_ROOT EXPO_PUBLIC_BASE44_APP_ID EXPO_PUBLIC_ACRCLOUD_HOST
+
+{
+  name: [32m'SPYNNERS DJ'[39m,
+  slug: [32m'spynners-dj'[39m,
+  version: [32m'1.0.0'[39m,
+  orientation: [32m'portrait'[39m,
+  icon: [32m'./assets/images/spynners-logo.png'[39m,
+  scheme: [32m'spynners'[39m,
+  userInterfaceStyle: [32m'dark'[39m,
+  plugins: [
+    [32m'expo-router'[39m,
+    [
+      [32m'expo-location'[39m,
+      {
+        locationAlwaysAndWhenInUsePermission: [32m'SPYNNERS utilise votre position pour trouver les clubs et événements DJ à proximité.'[39m
+      }
+    ],
+    [
+      [32m'expo-av'[39m,
+      {
+        microphonePermission: [32m'SPYNNERS utilise le microphone pour identifier les morceaux et enregistrer vos DJ sets.'[39m
+      }
+    ],
+    [
+      [32m'expo-image-picker'[39m,
+      {
+        photosPermission: [32m"SPYNNERS accède à vos photos pour les pochettes d'album et votre profil."[39m
+      }
+    ],
+    [32m'expo-font'[39m,
+    [32m'expo-secure-store'[39m,
+    [32m'expo-web-browser'[39m,
+    [
+      [32m'expo-notifications'[39m,
+      {
+        icon: [32m'./assets/images/spynners-logo.png'[39m,
+        color: [32m'#00D4FF'[39m
+      }
+    ]
+  ],
+  owner: [32m'benfranklin12345'[39m,
+  description: [90mundefined[39m,
+  sdkVersion: [32m'54.0.0'[39m,
+  platforms: [
+    [32m'ios'[39m,
+    [32m'android'[39m,
+    [32m'web'[39m
+  ],
+  ios: {
+    supportsTablet: [33mtrue[39m,
+    bundleIdentifier: [32m'com.abbas.spynners'[39m,
+    buildNumber: [32m'29'[39m,
+    associatedDomains: [
+      [32m'applinks:spynners.com'[39m,
+      [32m'webcredentials:spynners.com'[39m
+    ],
+    infoPlist: {
+      NSCameraUsageDescription: [32m'SPYNNERS utilise la caméra pour prendre des photos de vos événements DJ et les partager avec la communauté.'[39m,
+      NSMicrophoneUsageDescription: [32m'SPYNNERS utilise le microphone pour identifier les morceaux de musique en cours de lecture (Shazam-like) et enregistrer vos DJ sets.'[39m,
+      NSPhotoLibraryUsageDescription: [32m"SPYNNERS accède à votre galerie pour sélectionner des pochettes d'album et des photos de profil."[39m,
+      NSPhotoLibraryAddUsageDescription: [32m'SPYNNERS sauvegarde vos enregistrements DJ et les tracklists exportées dans votre galerie.'[39m,
+      NSLocationWhenInUseUsageDescription: [32m'SPYNNERS utilise votre position pour trouver les clubs et événements DJ à proximité.'[39m,
+      ITSAppUsesNonExemptEncryption: [33mfalse[39m,
+      UIBackgroundModes: [
+        [32m'audio'[39m
+      ],
+      NSAppleMusicUsageDescription: [32m'SPYNNERS peut accéder à Apple Music pour enrichir les informations des morceaux identifiés.'[39m
+    },
+    config: {
+      usesNonExemptEncryption: [33mfalse[39m
+    }
+  },
+  android: {
+    package: [32m'com.abbas.spynners'[39m,
+    versionCode: [33m1[39m,
+    permissions: [
+      [32m'android.permission.CAMERA'[39m,
+      [32m'android.permission.RECORD_AUDIO'[39m,
+      [32m'android.permission.ACCESS_FINE_LOCATION'[39m,
+      [32m'android.permission.ACCESS_COARSE_LOCATION'[39m,
+      [32m'android.permission.FOREGROUND_SERVICE'[39m,
+      [32m'android.permission.MODIFY_AUDIO_SETTINGS'[39m
+    ],
+    adaptiveIcon: {
+      foregroundImage: [32m'./assets/images/spynners-logo.png'[39m,
+      backgroundColor: [32m'#0a0a0a'[39m
+    }
+  },
+  web: {
+    bundler: [32m'metro'[39m,
+    output: [32m'static'[39m,
+    favicon: [32m'./assets/images/favicon.png'[39m
+  },
+  experiments: {
+    typedRoutes: [33mtrue[39m
+  },
+  extra: {
+    backendUrl: [32m'https://spynner-stable.preview.emergentagent.com'[39m,
+    base44AppId: [32m'691a4d96d819355b52c063f3'[39m,
+    acrcloudHost: [32m'identify-eu-west-1.acrcloud.com'[39m,
+    router: {},
+    eas: {
+      projectId: [32m'c1af0b44-03ab-45a7-9162-842db0b8c638'[39m
+    }
+  },
+  _internal: {
+    isDebug: [33mfalse[39m,
+    projectRoot: [32m'/app/frontend'[39m,
+    staticConfigPath: [32m'/app/frontend/app.json'[39m,
+    packageJsonPath: [32m'/app/frontend/package.json'[39m,
+    dynamicConfigPath: {},
+    pluginHistory: {
+      [32m'expo-location'[39m: {
+        name: [32m'expo-location'[39m,
+        version: [32m'19.0.8'[39m
+      },
+      [32m'expo-av'[39m: {
+        name: [32m'expo-av'[39m,
+        version: [32m'16.0.8'[39m
+      },
+      [32m'expo-image-picker'[39m: {
+        name: [32m'expo-image-picker'[39m,
+        version: [32m'17.0.10'[39m
+      },
+      [32m'expo-font'[39m: {
+        name: [32m'expo-font'[39m,
+        version: [32m'14.0.10'[39m
+      },
+      [32m'expo-secure-store'[39m: {
+        name: [32m'expo-secure-store'[39m,
+        version: [32m'15.0.8'[39m
+      },
+      [32m'expo-web-browser'[39m: {
+        name: [32m'expo-web-browser'[39m,
+        version: [32m'15.0.10'[39m
+      },
+      [32m'expo-notifications'[39m: {
+        name: [32m'expo-notifications'[39m,
+        version: [32m'0.32.15'[39m
+      }
+    }
+  }
+} failed), and EAS remote versioning ().
+-   **iOS Background Execution Limitations**: Faced the OS-level constraint of network and CPU suspension on screen lock. Attempted workarounds with  and user alerts.
+-   **Client-Side vs. Server-Side Logic**: The agent repeatedly toggled between client-side and server-side filtering for the track list () and PDF generation (), indicating brittle logic that needs a definitive implementation.
+-   **Base44 Entity Extension**: Successfully added a new data entity () to the mobile API service () based on user specifications from their web platform.
 
 **All files of reference**
--   : CRITICAL FILE. Central hub for all application text.
--   : CRITICAL FILE. Contains the fix for the recurring VIP bug.
--   : Contains the implementation and fix for the notification UI.
--   : Contains the header UI with the notification bell.
--   : Contains the fix for the VIP track state and UI cleanup.
--   , , : New files created in this session.
+-   : Must be edited to set .
+-   : The file where the suspected crashing code ( listener) was removed.
+-   : Contains the still-buggy PDF generation logic.
+-   : Contains the UI for received tracks, where the 0 count bug is visible.
+-    & : Core feature files that have issues related to screen-locking.
 
 **Critical Info for New Agent**
--   **Langue de l'utilisateur**: La communication doit impérativement être en **français**.
--   **Project Status**: The user considers the development phase **complete**. They have exported the code and successfully run the final An Expo user account is required to proceed.
+-   **Langue**: La communication doit être en **français**.
+-   **CRASH ON STARTUP IS P0**: Your absolute first priority is to create a new, stable iOS build. The previous build (#28) crashes. The suspected cause, an  listener, has been removed. You must:
+    1.  Update  to .
+    2.  Guide the user through the An Expo user account is required to proceed.
 
 Log in to EAS with email or username (exit and run eas login --help to see other login options)
-Input is required, but stdin is not readable. Failed to display prompt: Email or username. The next requests will likely be bug reports from their final testing or questions related to app store submission.
--   **High-Risk Regression**: The **VIP Purchase Persistence** bug has occurred twice. Any changes to  or VIP-related logic must be tested thoroughly on both web and mobile to prevent it from happening again. The key is ensuring calls to the local backend proxy use  and not another instance.
-
-**documents created in this job**
--   None.
+Input is required, but stdin is not readable. Failed to display prompt: Email or username command.
+    3.  Be prepared to troubleshoot build issues, like the previous version source is set to remote conflict. It may be wise to check  and disable remote versioning if it's active.
+-   **SYSTEMATIC VERIFICATION NEEDED**: The previous agent made a large number of fixes that have **not** been verified on a real device due to the crash. Once a stable build is ready, you must guide the user through testing each item in the Pending/In progress Issue list.
+-   **SCREEN LOCK IS A KNOWN ISSUE**: The problem of SPYN stopping when the user locks the screen is an iOS limitation. The current solution is a warning. Do not spend too much time trying to fix it unless the user insists, in which case you should research  for true background capabilities.
+-   **PDF EXPORT IS STILL BROKEN**: The date filter for the PDF download does not work correctly. You will likely need to debug the Python code in  again.
 
 **Last 10 User Messages and any pending HUMAN messages**
--   10. (LATEST) User shares the successful output of the An Expo user account is required to proceed.
-
-Log in to EAS with email or username (exit and run eas login --help to see other login options)
-Input is required, but stdin is not readable. Failed to display prompt: Email or username command. (RESOLVED)
--   9. User shares the  error encountered during the local build. (RESOLVED)
--   8. User shares the successful output of An Expo user account is required to proceed.
-
-Log in to EAS with email or username (exit and run eas login --help to see other login options)
-Input is required, but stdin is not readable. Failed to display prompt: Email or username. (ACKNOWLEDGED)
--   7. User asks which option to select for An Expo user account is required to proceed.
-
-Log in to EAS with email or username (exit and run eas login --help to see other login options)
-Input is required, but stdin is not readable. Failed to display prompt: Email or username (All). (RESOLVED)
--   6. User shares the directory listing of the correct project folder. (ACKNOWLEDGED)
--   5. User asks for help finding the correct project directory to run An Expo user account is required to proceed.
-
-Log in to EAS with email or username (exit and run eas login --help to see other login options)
-Input is required, but stdin is not readable. Failed to display prompt: Email or username. (IN PROGRESS)
--   4. User shares a directory listing from their home folder. (ACKNOWLEDGED)
--   3. User reports that the An Expo user account is required to proceed.
-
-Log in to EAS with email or username (exit and run eas login --help to see other login options)
-Input is required, but stdin is not readable. Failed to display prompt: Email or username command is failing locally. (IN PROGRESS)
--   2. User confirms they have exported the project to GitHub and asks for the next steps. (IN PROGRESS)
--   1. User states ok cest bon on peut finir (ok it's good we can finish), confirming all work is complete. (COMPLETED)
+-   10. User provides a detailed crash log for the native build. (COMPLETED)
+-   9. User is confused about how to find the crash log file. (COMPLETED)
+-   8. User asks for simpler instructions on what to look for in the crash log. (COMPLETED)
+-   7. Agent can't open the large crash log file. (COMPLETED)
+-   6. **User reports the new build crashes on startup.** (IN PROGRESS)
+-   5. User asks if they should build after the version number was set to 28. (COMPLETED)
+-   4. User asks to verify the build number is 28. (COMPLETED)
+-   3. User corrects the agent that the build number should be 28, not 25. (COMPLETED)
+-   2. User is confused by the agent setting the build number to 25. (COMPLETED)
+-   1. User asks the agent to verify the build number is set to 28. (COMPLETED)
 
 **Project Health Check:**
--   **Healthy**: The application is stable, feature-complete according to the user, and all known critical bugs have been resolved.
+-   **Broken**: The primary distribution artifact (the iOS native build) is non-functional, as it crashes on launch. This is a critical failure blocking all further user testing and progress.
 
 **3rd Party Integrations**
--   **Spynners / Base44**: Primary Backend-as-a-Service (BaaS) for data storage.
--   **Ngrok**: Used for the Expo Go tunnel for mobile testing.
--   **Expo Application Services (EAS)**: Used by the user locally for building the final app binaries.
+-   **Spynners / Base44**: Primary Backend-as-a-Service (BaaS).
+-   **@base44/sdk**: SDK for Base44.
+-   **Expo Application Services (EAS)**: For building and submitting the app.
+-   **ACRCloud**: Audio recognition (via Base44).
+-   **Google Places**: Venue lookup (via Base44).
+-   **expo-keep-awake**: Used to prevent the screen from sleeping during sessions.
+-   **ffmpeg**: Installed on the backend to process audio files.
 
 **Testing status**
--   Testing agent used after significant changes: YES. The  was used and passed before the end of the session. The agent also used screenshot tools extensively to verify UI changes.
+-   Testing agent used after significant changes: YES (both backend and frontend agents were run before the final build attempt).
 -   Troubleshoot agent used after agent stuck in loop: NO
--   Test files created: []
--   Known regressions: The VIP purchase persistence bug was a known regression that was identified and fixed during this session.
+-   Test files created: None.
+-   Known regressions: The PDF download functionality has regressed multiple times. The filtering on the home page was also a recurring issue that seems to be stable now. The startup crash is a new, major regression.
 
 **Credentials to test flow:**
 -   **Email:** 
 -   **Password:** 
+-   **EAS Login**: The agent is not logged into EAS. The user has been running build commands from their local machine.
 
 **What agent forgot to execute**
--   The Black Diamond data discrepancy issue, which was noted as a future (P2) task in the initial summary, was not addressed. Given the user's desire to finalize and build the app, this was implicitly deprioritized. It remains an outstanding, low-priority technical debt item.
+The agent did not verify the  configuration, which led to a build number conflict where the   was ignored by the EAS service. This wasted time and caused a failed submission. The agent also did not create a systematic test plan for the user to verify all the batch fixes, leading to a confusing and repetitive cycle of bug reports.
 
 </analysis>
