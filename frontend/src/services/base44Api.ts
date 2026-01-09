@@ -1,0 +1,2605 @@
+/**
+ * Base44 API Service for SPYNNERS
+ * Uses direct Base44 API on mobile, backend proxy on web to avoid CORS
+ */
+
+// IMPORTANT: This polyfill must be imported first for crypto support in React Native
+import 'react-native-get-random-values';
+
+import axios, { AxiosError, AxiosInstance } from 'axios';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import Constants from 'expo-constants';
+import { Platform } from 'react-native';
+import { createClient } from '@base44/sdk';
+
+// Backend URL for web proxy
+const BACKEND_URL = Constants.expoConfig?.extra?.backendUrl || 
+  process.env.EXPO_PUBLIC_BACKEND_URL || 
+  'https://spynner-stable.preview.emergentagent.com';
+
+// Direct Base44 API URL for mobile - MUST use app subdomain
+const BASE44_APP_ID = '691a4d96d819355b52c063f3';
+const BASE44_DIRECT_URL = `https://spynners.base44.app/api/apps/${BASE44_APP_ID}`;
+
+// Determine which URL to use based on platform
+const API_BASE_URL = Platform.OS === 'web' ? BACKEND_URL : BASE44_DIRECT_URL;
+
+console.log('[API] Platform:', Platform.OS);
+console.log('[API] Using API URL:', API_BASE_URL);
+
+// Storage keys
+const AUTH_TOKEN_KEY = 'auth_token';
+const USER_KEY = 'user';
+
+// ============================================
+// CACHING SYSTEM - Reduce API calls
+// ============================================
+interface CacheItem<T> {
+  data: T;
+  timestamp: number;
+  expiresIn: number; // milliseconds
+}
+
+const memoryCache: Record<string, CacheItem<any>> = {};
+
+// Cache durations (in milliseconds)
+const CACHE_DURATIONS = {
+  tracks: 5 * 60 * 1000,      // 5 minutes for tracks
+  users: 10 * 60 * 1000,      // 10 minutes for users
+  userProfile: 15 * 60 * 1000, // 15 minutes for user profile
+  short: 1 * 60 * 1000,       // 1 minute for frequently changing data
+};
+
+// Get from cache
+function getFromCache<T>(key: string): T | null {
+  const item = memoryCache[key];
+  if (!item) return null;
+  
+  const now = Date.now();
+  if (now - item.timestamp > item.expiresIn) {
+    // Cache expired
+    delete memoryCache[key];
+    console.log('[Cache] Expired:', key);
+    return null;
+  }
+  
+  console.log('[Cache] HIT:', key);
+  return item.data;
+}
+
+// Set cache
+function setCache<T>(key: string, data: T, expiresIn: number): void {
+  memoryCache[key] = {
+    data,
+    timestamp: Date.now(),
+    expiresIn,
+  };
+  console.log('[Cache] SET:', key, 'expires in', expiresIn / 1000, 'seconds');
+}
+
+// Clear specific cache
+function clearCache(keyPattern?: string): void {
+  if (keyPattern) {
+    Object.keys(memoryCache).forEach(key => {
+      if (key.includes(keyPattern)) {
+        delete memoryCache[key];
+      }
+    });
+    console.log('[Cache] Cleared pattern:', keyPattern);
+  } else {
+    Object.keys(memoryCache).forEach(key => delete memoryCache[key]);
+    console.log('[Cache] Cleared all');
+  }
+}
+
+// Export cache utilities
+export const cacheUtils = {
+  get: getFromCache,
+  set: setCache,
+  clear: clearCache,
+  durations: CACHE_DURATIONS,
+};
+// ============================================
+
+// Create axios instance
+const createApi = (): AxiosInstance => {
+  const instance = axios.create({
+    baseURL: API_BASE_URL,
+    timeout: 30000,
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  });
+
+  // Add auth token to requests
+  instance.interceptors.request.use(async (config) => {
+    try {
+      let token = null;
+      
+      // Try AsyncStorage first
+      try {
+        token = await AsyncStorage.getItem(AUTH_TOKEN_KEY);
+      } catch (e) {
+        // AsyncStorage might not work on web SSR
+      }
+      
+      // Fallback to localStorage for web
+      if (!token && typeof window !== 'undefined' && window.localStorage) {
+        token = window.localStorage.getItem(AUTH_TOKEN_KEY);
+      }
+      
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`;
+        console.log('[API] Token attached to request');
+      } else {
+        console.log('[API] No token found');
+      }
+    } catch (e) {
+      console.error('[API] Error getting token:', e);
+    }
+    console.log('[API] Request:', config.method?.toUpperCase(), config.baseURL, config.url);
+    return config;
+  });
+
+  // Log responses and errors
+  instance.interceptors.response.use(
+    (response) => {
+      console.log('[API] Response:', response.status, response.config.url);
+      return response;
+    },
+    (error: AxiosError) => {
+      console.error('[API] Error:', error.response?.status, error.message);
+      return Promise.reject(error);
+    }
+  );
+
+  return instance;
+};
+
+const api = createApi();
+
+// Helper function to get the correct API path based on platform
+// On mobile: use direct Base44 paths
+// On web: use proxy paths through backend
+const getApiPath = (path: string): string => {
+  if (Platform.OS === 'web') {
+    // Web uses proxy
+    return path;
+  }
+  
+  // Mobile uses direct Base44 API - transform paths
+  // /api/base44/entities/Track -> /entities/Track
+  // /api/base44/auth/login -> /auth/login
+  // /api/tracks -> /entities/Track (for backend proxy routes)
+  if (path.startsWith('/api/base44/')) {
+    return path.replace('/api/base44', '');
+  }
+  if (path.startsWith('/api/admin/')) {
+    // Admin routes - transform to entities calls
+    if (path.includes('/downloads')) {
+      return '/entities/Track';
+    }
+    if (path.includes('/users')) {
+      return '/entities/User';
+    }
+    return path;
+  }
+  if (path === '/api/tracks' || path.startsWith('/api/tracks?')) {
+    return path.replace('/api/tracks', '/entities/Track');
+  }
+  
+  return path;
+};
+
+// Wrapper API that transforms paths based on platform
+const mobileApi = {
+  async get(path: string, config?: any) {
+    return api.get(getApiPath(path), config);
+  },
+  async post(path: string, data?: any, config?: any) {
+    return api.post(getApiPath(path), data, config);
+  },
+  async put(path: string, data?: any, config?: any) {
+    return api.put(getApiPath(path), data, config);
+  },
+  async delete(path: string, config?: any) {
+    return api.delete(getApiPath(path), config);
+  },
+  async patch(path: string, data?: any, config?: any) {
+    return api.patch(getApiPath(path), data, config);
+  },
+};
+
+// ==================== TRACK TYPE ====================
+
+export interface Track {
+  id?: string;
+  _id?: string;
+  title: string;
+  // Old fields (for compatibility)
+  artist_name?: string;
+  cover_image?: string;
+  audio_file?: string;
+  // New Base44 fields
+  producer_id?: string;
+  producer_name?: string;
+  collaborators?: string[];
+  genre: string;
+  bpm?: number;
+  key?: string;
+  energy_level?: string;
+  mood?: string;
+  description?: string;
+  artwork_url?: string;
+  email_artwork_url?: string;
+  audio_url?: string;
+  duration?: number;
+  isrc?: string;
+  iswc?: string;
+  status?: string; // 'approved', 'pending', 'rejected'
+  play_count?: number;
+  download_count?: number;
+  average_rating?: number;
+  rating_count?: number;
+  release_date?: string;
+  free_download_agreement?: boolean;
+  acrcloud_id?: string;
+  needs_label?: boolean;
+  is_vip?: boolean;
+  vip_requested?: boolean;
+  vip_preview_start?: number;
+  vip_preview_end?: number;
+  created_date?: string;
+  updated_date?: string;
+  created_by_id?: string;
+  is_sample?: boolean;
+  // Legacy fields
+  label_name?: string;
+  isrc_code?: string;
+  iswc_code?: string;
+  is_unreleased?: boolean;
+  is_approved?: boolean;
+  rights_confirmed?: boolean;
+  free_download_authorized?: boolean;
+  uploaded_by?: string;
+  uploaded_for?: string;
+  rating?: number;
+  created_at?: string;
+}
+
+// ==================== USER TYPE ====================
+
+export interface User {
+  id?: string;
+  _id?: string;
+  email: string;
+  full_name: string;
+  user_type?: string;
+  avatar?: string;
+  avatar_url?: string;
+  is_admin?: boolean;
+  role?: 'admin' | 'admin_readonly' | 'user' | string; // Admin role field from Base44
+  diamonds?: number;
+  black_diamonds?: number;
+  is_vip?: boolean;
+  artist_name?: string;
+  bio?: string;
+  nationality?: string;
+  instagram_url?: string;
+  soundcloud?: string;
+  sacem_number?: string;
+  auto_message_settings?: {
+    message?: string;
+    enabled?: boolean;
+  };
+  preferred_genres?: string[];
+  data?: {
+    black_diamonds?: number;
+    [key: string]: any;
+  };
+}
+
+// ==================== PUBLIC PROFILE TYPE ====================
+
+export interface PublicProfile {
+  id: string;
+  full_name: string;
+  artist_name?: string;
+  email?: string;
+  avatar_url?: string;
+  generated_avatar_url?: string;
+  bio?: string;
+  location?: string;
+  country?: string;
+  genres?: string[];
+  social_links?: {
+    instagram?: string;
+    soundcloud?: string;
+    spotify?: string;
+    beatport?: string;
+    youtube?: string;
+    facebook?: string;
+    twitter?: string;
+    website?: string;
+  };
+  black_diamonds?: number;
+  sacem_number?: string;
+  user_type?: string;
+  stats?: {
+    tracks_count?: number;
+    total_plays?: number;
+    total_downloads?: number;
+    followers_count?: number;
+  };
+}
+
+// ==================== PLAYLIST TYPE ====================
+
+export interface Playlist {
+  id?: string;
+  _id?: string;
+  name: string;
+  user_id: string;
+  tracks: string[];
+  is_public?: boolean;
+  created_at?: string;
+}
+
+// ==================== AUTH SERVICE ====================
+
+export const base44Auth = {
+  async login(email: string, password: string): Promise<{ token: string; user: User }> {
+    try {
+      console.log('[Auth] Logging in via proxy:', email);
+      const response = await mobileApi.post('/api/base44/auth/login', {
+        email,
+        password,
+      });
+      
+      // Base44 returns access_token, not token
+      const token = response.data.access_token || response.data.token;
+      const rawUser = response.data.user;
+      
+      // Flatten user data - Base44 stores extra fields in user.data
+      const userData = rawUser?.data || {};
+      const user = {
+        ...rawUser,
+        // Flatten important fields from data
+        black_diamonds: userData.black_diamonds || rawUser.black_diamonds || 0,
+        avatar_url: userData.avatar_url || rawUser.avatar_url,
+        artist_name: userData.artist_name || rawUser.artist_name,
+        bio: userData.bio || rawUser.bio,
+        user_type: userData.user_type || rawUser.user_type,
+        nationality: userData.nationality || rawUser.nationality,
+        instagram_url: userData.instagram_url || rawUser.instagram_url,
+        soundcloud: userData.soundcloud || rawUser.soundcloud,
+        sacem_number: userData.sacem_number || rawUser.sacem_number,
+        auto_message_settings: userData.auto_message_settings || rawUser.auto_message_settings,
+        preferred_genres: userData.preferred_genres || rawUser.preferred_genres,
+      };
+      
+      console.log('[Auth] Token received:', token ? 'Yes' : 'No');
+      console.log('[Auth] User black_diamonds:', user.black_diamonds);
+      
+      // Save to storage
+      if (token) {
+        console.log('[Auth] Saving token...');
+        await AsyncStorage.setItem(AUTH_TOKEN_KEY, token);
+        await AsyncStorage.setItem(USER_KEY, JSON.stringify(user));
+        
+        // Also save to localStorage for web compatibility
+        if (typeof window !== 'undefined' && window.localStorage) {
+          window.localStorage.setItem(AUTH_TOKEN_KEY, token);
+          window.localStorage.setItem(USER_KEY, JSON.stringify(user));
+          console.log('[Auth] Token saved to localStorage');
+        }
+      } else {
+        console.error('[Auth] No token received from login!');
+      }
+      
+      console.log('[Auth] Login successful, token saved');
+      return { token, user };
+    } catch (error: any) {
+      console.error('[Auth] Login error:', error?.response?.data || error?.message);
+      throw new Error(error?.response?.data?.detail || error?.response?.data?.message || 'Login failed');
+    }
+  },
+
+  async signup(email: string, password: string, fullName: string, userType?: string): Promise<{ token: string; user: User }> {
+    try {
+      console.log('[Auth] Signing up via proxy:', email);
+      const response = await mobileApi.post('/api/base44/auth/signup', {
+        email,
+        password,
+        full_name: fullName,
+        user_type: userType,
+      });
+      
+      const { token, user } = response.data;
+      
+      // Save to storage
+      if (token) {
+        await AsyncStorage.setItem(AUTH_TOKEN_KEY, token);
+        await AsyncStorage.setItem(USER_KEY, JSON.stringify({ ...user, user_type: userType }));
+      }
+      
+      console.log('[Auth] Signup successful');
+      return response.data;
+    } catch (error: any) {
+      console.error('[Auth] Signup error:', error?.response?.data || error?.message);
+      throw new Error(error?.response?.data?.detail || error?.response?.data?.message || 'Signup failed');
+    }
+  },
+
+  async me(): Promise<User | null> {
+    try {
+      // On mobile, we can't use /api/base44/auth/me - get user from storage
+      if (Platform.OS !== 'web') {
+        console.log('[Auth] Mobile: Getting user from storage');
+        const userStr = await AsyncStorage.getItem(USER_KEY);
+        if (userStr) {
+          const user = JSON.parse(userStr);
+          console.log('[Auth] Mobile: Got user from storage:', user.email);
+          return user;
+        }
+        return null;
+      }
+      
+      // On web, use the proxy
+      const response = await mobileApi.get('/api/base44/auth/me');
+      return response.data;
+    } catch (error: any) {
+      // 404 is expected when user is not logged in - don't show error
+      if (error?.response?.status === 404) {
+        console.log('[Auth] No active session (user not logged in)');
+        return null;
+      }
+      // Only log actual errors
+      console.error('[Auth] Error getting current user:', error?.message || error);
+      return null;
+    }
+  },
+
+  async logout(): Promise<void> {
+    try {
+      await AsyncStorage.removeItem(AUTH_TOKEN_KEY);
+      await AsyncStorage.removeItem(USER_KEY);
+      console.log('[Auth] Logged out');
+    } catch (error) {
+      console.error('[Auth] Logout error:', error);
+    }
+  },
+
+  async getStoredUser(): Promise<User | null> {
+    try {
+      const userJson = await AsyncStorage.getItem(USER_KEY);
+      return userJson ? JSON.parse(userJson) : null;
+    } catch (error) {
+      console.error('[Auth] Error getting stored user:', error);
+      return null;
+    }
+  },
+
+  async getStoredToken(): Promise<string | null> {
+    try {
+      return await AsyncStorage.getItem(AUTH_TOKEN_KEY);
+    } catch (error) {
+      console.error('[Auth] Error getting stored token:', error);
+      return null;
+    }
+  },
+
+  async updateUserDiamonds(userId: string, amount: number, currentBalance?: number): Promise<void> {
+    try {
+      console.log('[Auth] Updating user diamonds:', userId, amount, 'current:', currentBalance);
+      
+      // IMPORTANT: Always use backend URL for this endpoint (not Base44 direct)
+      const backendUrl = Constants.expoConfig?.extra?.backendUrl || 
+        process.env.EXPO_PUBLIC_BACKEND_URL || 
+        'https://spynner-stable.preview.emergentagent.com';
+      
+      const token = await AsyncStorage.getItem('auth_token');
+      
+      const response = await axios.post(`${backendUrl}/api/base44/update-diamonds`, {
+        user_id: userId,
+        amount: amount, // positive to add, negative to deduct
+        current_balance: currentBalance, // pass current balance for reliable calculation
+      }, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': token ? `Bearer ${token}` : '',
+        },
+        timeout: 30000,
+      });
+      console.log('[Auth] Diamonds updated:', response.data);
+    } catch (error: any) {
+      console.error('[Auth] Error updating diamonds:', error?.response?.data || error?.message);
+      throw new Error(error?.response?.data?.detail || 'Failed to update diamonds');
+    }
+  },
+};
+
+// ==================== TRACKS SERVICE ====================
+
+export const base44Tracks = {
+  async list(filters?: {
+    genre?: string;
+    energy_level?: string;
+    sort?: string;
+    limit?: number;
+    is_vip?: boolean;
+  }): Promise<Track[]> {
+    try {
+      // Generate cache key based on filters
+      const cacheKey = `tracks_${JSON.stringify(filters || {})}`;
+      
+      // Check cache first
+      const cachedTracks = getFromCache<Track[]>(cacheKey);
+      if (cachedTracks) {
+        return cachedTracks;
+      }
+      
+      console.log('[Tracks] Fetching tracks with filters:', filters);
+      
+      // On mobile, use Base44 entities directly
+      if (Platform.OS !== 'web') {
+        const params = new URLSearchParams();
+        params.append('limit', (filters?.limit || 100).toString());
+        if (filters?.sort) params.append('sort', filters.sort);
+        else params.append('sort', '-created_date');
+        if (filters?.genre) params.append('genre', filters.genre);
+        if (filters?.energy_level) params.append('energy_level', filters.energy_level);
+        if (filters?.is_vip !== undefined) params.append('is_vip', filters.is_vip.toString());
+
+        const url = `/entities/Track?${params.toString()}`;
+        console.log('[Tracks] Mobile API URL:', url);
+        
+        const response = await mobileApi.get(url);
+        const data = response.data;
+        
+        if (Array.isArray(data)) {
+          console.log('[Tracks] Got', data.length, 'tracks from Base44');
+          // Cache the result
+          setCache(cacheKey, data, CACHE_DURATIONS.tracks);
+          return data;
+        }
+        return [];
+      }
+      
+      // On web, try native API first
+      try {
+        const nativeResponse = await mobileApi.post('/api/tracks/all', {
+          genre: filters?.genre,
+          limit: filters?.limit || 100,
+          offset: 0
+        });
+        
+        if (nativeResponse.data?.success && nativeResponse.data?.tracks) {
+          console.log('[Tracks] Native API returned:', nativeResponse.data.tracks.length, 'tracks');
+          setCache(cacheKey, nativeResponse.data.tracks, CACHE_DURATIONS.tracks);
+          return nativeResponse.data.tracks;
+        }
+        if (Array.isArray(nativeResponse.data)) {
+          console.log('[Tracks] Native API returned array:', nativeResponse.data.length, 'tracks');
+          setCache(cacheKey, nativeResponse.data, CACHE_DURATIONS.tracks);
+          return nativeResponse.data;
+        }
+      } catch (nativeError) {
+        console.log('[Tracks] Native API failed, falling back to Base44...');
+      }
+      
+      // Fallback to Base44 entities
+      const params = new URLSearchParams();
+      if (filters?.limit) params.append('limit', filters.limit.toString());
+      if (filters?.sort) params.append('sort', filters.sort);
+      if (filters?.genre) params.append('genre', filters.genre);
+      if (filters?.energy_level) params.append('energy_level', filters.energy_level);
+      if (filters?.is_vip !== undefined) params.append('is_vip', filters.is_vip.toString());
+
+      const url = `/api/base44/entities/Track${params.toString() ? `?${params.toString()}` : ''}`;
+      console.log('[Tracks] Fallback API URL:', url);
+      
+      const response = await mobileApi.get(url);
+      
+      const data = response.data;
+      let tracks: Track[] = [];
+      
+      if (Array.isArray(data)) {
+        tracks = data;
+      } else if (data?.items && Array.isArray(data.items)) {
+        tracks = data.items;
+      } else if (data?.data && Array.isArray(data.data)) {
+        tracks = data.data;
+      }
+      
+      console.log('[Tracks] Parsed tracks count:', tracks.length);
+      return tracks;
+    } catch (error: any) {
+      console.error('[Tracks] Error fetching tracks:', error?.response?.status, error?.message);
+      return [];
+    }
+  },
+
+  async listVIP(): Promise<Track[]> {
+    return this.list({ is_vip: true });
+  },
+
+  async getById(trackId: string): Promise<Track | null> {
+    try {
+      console.log('[Tracks] Getting track by ID:', trackId);
+      
+      // On mobile, use direct Base44 API
+      if (Platform.OS !== 'web') {
+        const response = await mobileApi.get(`/entities/Track/${trackId}`);
+        console.log('[Tracks] Mobile - Got track:', response.data?.title);
+        return response.data;
+      }
+      
+      // On web, use backend proxy
+      const response = await mobileApi.get(`/api/base44/entities/Track/${trackId}`);
+      console.log('[Tracks] Web - Got track:', response.data?.title);
+      return response.data;
+    } catch (error) {
+      console.error('[Tracks] Error getting track by ID:', trackId, error);
+      return null;
+    }
+  },
+
+  async get(trackId: string): Promise<Track | null> {
+    return this.getById(trackId);
+  },
+
+  async create(track: Partial<Track>): Promise<Track | null> {
+    try {
+      const response = await mobileApi.post('/api/base44/entities/Track', track);
+      return response.data;
+    } catch (error) {
+      console.error('[Tracks] Error creating track:', error);
+      throw error;
+    }
+  },
+
+  async update(trackId: string, updates: Partial<Track>): Promise<Track | null> {
+    try {
+      const response = await mobileApi.put(`/api/base44/entities/Track/${trackId}`, updates);
+      return response.data;
+    } catch (error) {
+      console.error('[Tracks] Error updating track:', error);
+      throw error;
+    }
+  },
+
+  async delete(trackId: string): Promise<boolean> {
+    try {
+      await mobileApi.delete(`/api/base44/entities/Track/${trackId}`);
+      return true;
+    } catch (error) {
+      console.error('[Tracks] Error deleting track:', error);
+      return false;
+    }
+  },
+
+  async search(query: string): Promise<Track[]> {
+    try {
+      console.log('[Tracks] Searching for:', query);
+      // Base44 doesn't have a global search, so we fetch all tracks and filter client-side
+      const response = await mobileApi.get(`/api/base44/entities/Track?limit=500`);
+      const data = response.data;
+      let tracks: Track[] = [];
+      
+      if (Array.isArray(data)) {
+        tracks = data;
+      } else if (data?.items) {
+        tracks = data.items;
+      }
+      
+      // Filter tracks by query (title, artist, genre, producer)
+      const queryLower = query.toLowerCase();
+      const filtered = tracks.filter((track: Track) => {
+        const title = (track.title || '').toLowerCase();
+        const artist = (track.artist_name || track.producer_name || '').toLowerCase();
+        const genre = (track.genre || '').toLowerCase();
+        const producer = (track.producer_name || '').toLowerCase();
+        
+        return title.includes(queryLower) || 
+               artist.includes(queryLower) || 
+               genre.includes(queryLower) ||
+               producer.includes(queryLower);
+      });
+      
+      console.log('[Tracks] Search results:', filtered.length, 'tracks found');
+      return filtered;
+    } catch (error) {
+      console.error('[Tracks] Search error:', error);
+      return [];
+    }
+  },
+
+  async myUploads(userId: string): Promise<Track[]> {
+    try {
+      const response = await mobileApi.get(`/api/base44/entities/Track?uploaded_by=${userId}`);
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[Tracks] Error getting my uploads:', error);
+      return [];
+    }
+  },
+
+  async rate(trackId: string, rating: number): Promise<any> {
+    try {
+      const response = await mobileApi.post('/api/base44/functions/invoke/rate_track', {
+        track_id: trackId,
+        rating,
+      });
+      return response.data;
+    } catch (error) {
+      console.error('[Tracks] Error rating track:', error);
+    }
+  },
+
+  async download(trackId: string): Promise<any> {
+    try {
+      const response = await mobileApi.post('/api/base44/functions/invoke/download_track', {
+        track_id: trackId,
+      });
+      return response.data;
+    } catch (error) {
+      console.error('[Tracks] Error recording download:', error);
+    }
+  },
+
+  async play(trackId: string): Promise<any> {
+    try {
+      const response = await mobileApi.post('/api/base44/functions/invoke/play_track', {
+        track_id: trackId,
+      });
+      return response.data;
+    } catch (error) {
+      // Silently ignore - this is just for analytics and not critical
+      // console.error('[Tracks] Error recording play:', error);
+    }
+  },
+};
+
+// ==================== USERS SERVICE ====================
+
+export const base44Users = {
+  async list(filters?: { user_type?: string; search?: string; limit?: number }): Promise<User[]> {
+    try {
+      // Generate cache key based on filters
+      const cacheKey = `users_${JSON.stringify(filters || {})}`;
+      
+      // Check cache first
+      const cachedUsers = getFromCache<User[]>(cacheKey);
+      if (cachedUsers) {
+        return cachedUsers;
+      }
+      
+      console.log('[Users] Listing users with filters:', filters);
+      
+      // Use the admin users endpoint which can fetch all users (up to 10000)
+      try {
+        const response = await mobileApi.get(`/api/admin/users?limit=${filters?.limit || 2000}`);
+        const data = response.data;
+        
+        if (Array.isArray(data) && data.length > 0) {
+          console.log('[Users] Got', data.length, 'users from admin endpoint');
+          setCache(cacheKey, data, CACHE_DURATIONS.users);
+          return data;
+        } else if (data?.items && data.items.length > 0) {
+          console.log('[Users] Got', data.items.length, 'users from items');
+          setCache(cacheKey, data.items, CACHE_DURATIONS.users);
+          return data.items;
+        } else if (data?.users && data.users.length > 0) {
+          console.log('[Users] Got', data.users.length, 'users from users');
+          setCache(cacheKey, data.users, CACHE_DURATIONS.users);
+          return data.users;
+        }
+      } catch (adminError) {
+        console.log('[Users] Admin endpoint failed, trying entity API:', adminError);
+      }
+      
+      // Fallback to entity API
+      const params = new URLSearchParams();
+      params.append('limit', String(filters?.limit || 1000));
+      if (filters?.user_type) params.append('user_type', filters.user_type);
+      if (filters?.search) params.append('search', filters.search);
+
+      const response = await mobileApi.get(`/api/base44/entities/User?${params.toString()}`);
+      const data = response.data;
+      
+      if (Array.isArray(data) && data.length > 0) {
+        console.log('[Users] Got', data.length, 'users from entity API');
+        setCache(cacheKey, data, CACHE_DURATIONS.users);
+        return data;
+      }
+      if (data?.items && data.items.length > 0) {
+        setCache(cacheKey, data.items, CACHE_DURATIONS.users);
+        return data.items;
+      }
+      
+      // Last fallback: extract from tracks
+      console.log('[Users] No users from APIs, trying tracks fallback...');
+      return await this.fetchAllUsersFromTracks();
+    } catch (error) {
+      console.error('[Users] Error listing users:', error);
+      return await this.fetchAllUsersFromTracks();
+    }
+  },
+
+  // Native function to get all users with pagination (for chat/members list)
+  async nativeGetAllUsers(params?: { search?: string; limit?: number; offset?: number }): Promise<User[]> {
+    try {
+      // Generate cache key
+      const cacheKey = `users_native_${JSON.stringify(params || {})}`;
+      
+      // Check cache first (shorter duration for search results)
+      const cachedUsers = getFromCache<User[]>(cacheKey);
+      if (cachedUsers && !params?.search) {
+        return cachedUsers;
+      }
+      
+      console.log('[Users] Fetching all users via nativeGetAllUsers:', params);
+      
+      // Try direct Base44 entity API first (more reliable on mobile)
+      try {
+        const BASE44_APP_ID = '691a4d96d819355b52c063f3';
+        const queryParams = new URLSearchParams();
+        queryParams.append('limit', String(params?.limit || 1000));
+        if (params?.offset) queryParams.append('offset', String(params.offset));
+        
+        // Direct fetch to Base44 API
+        const directUrl = `https://spynners.base44.app/api/apps/${BASE44_APP_ID}/entities/User?${queryParams.toString()}`;
+        console.log('[Users] Trying direct Base44 URL:', directUrl);
+        
+        const directResponse = await fetch(directUrl, {
+          method: 'GET',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+        });
+        
+        if (directResponse.ok) {
+          const directData = await directResponse.json();
+          console.log('[Users] Direct Base44 response length:', Array.isArray(directData) ? directData.length : 'not array');
+          
+          if (Array.isArray(directData) && directData.length > 0) {
+            // Filter by search if provided
+            if (params?.search && params.search.length > 0) {
+              const searchLower = params.search.toLowerCase();
+              return directData.filter((u: any) => {
+                const name = (u.full_name || u.artist_name || u.email || '').toLowerCase();
+                return name.includes(searchLower);
+              });
+            }
+            return directData;
+          }
+        }
+      } catch (directError) {
+        console.log('[Users] Direct Base44 fetch failed:', directError);
+      }
+      
+      // Fallback: Try via mobileApi
+      const response = await mobileApi.post('/api/base44/functions/invoke/nativeGetAllUsers', {
+        search: params?.search || '',
+        limit: params?.limit || 100,
+        offset: params?.offset || 0,
+      });
+      
+      const data = response.data;
+      console.log('[Users] nativeGetAllUsers response:', data);
+      
+      // Handle different response formats
+      if (Array.isArray(data)) return data;
+      if (data?.users) return data.users;
+      if (data?.items) return data.items;
+      if (data?.data) return data.data;
+      
+      // Last fallback: extract from tracks
+      console.log('[Users] No users from API, trying tracks fallback...');
+      return await this.fetchAllUsersFromTracks();
+    } catch (error) {
+      console.error('[Users] Error in nativeGetAllUsers:', error);
+      // Final fallback
+      return await this.fetchAllUsersFromTracks();
+    }
+  },
+
+  // Fetch all users by extracting unique producers from all tracks
+  async fetchAllUsersFromTracks(): Promise<User[]> {
+    try {
+      console.log('[Users] Fetching all users from tracks with pagination...');
+      const allUsers = new Map<string, User>();
+      const pageSize = 200;
+      let offset = 0;
+      let hasMore = true;
+      let totalTracksProcessed = 0;
+      
+      while (hasMore) {
+        const params = new URLSearchParams();
+        params.append('limit', pageSize.toString());
+        params.append('offset', offset.toString());
+        
+        const response = await mobileApi.get(`/api/base44/entities/Track?${params.toString()}`);
+        const data = response.data;
+        
+        let tracks: any[] = [];
+        if (Array.isArray(data)) {
+          tracks = data;
+        } else if (data?.items) {
+          tracks = data.items;
+        } else if (data?.data) {
+          tracks = data.data;
+        }
+        
+        console.log(`[Users] Fetched ${tracks.length} tracks at offset ${offset}`);
+        
+        if (tracks.length > 0) {
+          tracks.forEach((track: any) => {
+            // Extract producer info
+            const producerId = track.producer_id || track.created_by_id || track.uploaded_by || '';
+            const producerName = track.producer_name || track.artist_name || 'Unknown';
+            
+            if (producerId && !allUsers.has(producerId)) {
+              allUsers.set(producerId, {
+                id: producerId,
+                _id: producerId,
+                email: '',
+                full_name: producerName,
+                user_type: 'producer',
+              });
+            }
+            
+            // Also check collaborators
+            if (track.collaborators && Array.isArray(track.collaborators)) {
+              track.collaborators.forEach((collab: any) => {
+                const collabId = typeof collab === 'string' ? collab : collab.id || collab._id;
+                const collabName = typeof collab === 'string' ? collab : collab.name || collab.full_name;
+                if (collabId && !allUsers.has(collabId)) {
+                  allUsers.set(collabId, {
+                    id: collabId,
+                    _id: collabId,
+                    email: '',
+                    full_name: collabName || 'Unknown',
+                    user_type: 'producer',
+                  });
+                }
+              });
+            }
+          });
+          
+          totalTracksProcessed += tracks.length;
+          offset += pageSize;
+          
+          // If we got less than the page size, we're done
+          if (tracks.length < pageSize) {
+            hasMore = false;
+          }
+          
+          // Safety limit to prevent infinite loops (max 5000 tracks = ~25 requests)
+          if (offset >= 5000) {
+            hasMore = false;
+          }
+        } else {
+          hasMore = false;
+        }
+      }
+      
+      console.log(`[Users] Total tracks processed: ${totalTracksProcessed}, Unique users found: ${allUsers.size}`);
+      return Array.from(allUsers.values());
+    } catch (error) {
+      console.error('[Users] Error fetching users from tracks:', error);
+      return [];
+    }
+  },
+
+  // Fetch all users with pagination (fetches multiple pages)
+  async fetchAllUsersWithPagination(searchQuery?: string): Promise<User[]> {
+    try {
+      console.log('[Users] Fetching all users with pagination...');
+      
+      // First try the native function
+      const nativeUsers = await this.nativeGetAllUsers({
+        search: searchQuery || '',
+        limit: 100,
+        offset: 0,
+      });
+      
+      if (nativeUsers.length > 0) {
+        console.log('[Users] Got users from nativeGetAllUsers:', nativeUsers.length);
+        
+        // If we got some users, try to paginate to get more
+        if (nativeUsers.length >= 100) {
+          let allUsers = [...nativeUsers];
+          let offset = 100;
+          let hasMore = true;
+          
+          while (hasMore && offset < 2000) {
+            const moreUsers = await this.nativeGetAllUsers({
+              search: searchQuery || '',
+              limit: 100,
+              offset,
+            });
+            
+            if (moreUsers.length > 0) {
+              allUsers.push(...moreUsers);
+              offset += 100;
+              if (moreUsers.length < 100) hasMore = false;
+            } else {
+              hasMore = false;
+            }
+          }
+          
+          return allUsers;
+        }
+        
+        return nativeUsers;
+      }
+      
+      // If native function failed, fallback to extracting from tracks
+      console.log('[Users] Falling back to extracting users from tracks...');
+      return await this.fetchAllUsersFromTracks();
+    } catch (error) {
+      console.error('[Users] Error fetching all users with pagination:', error);
+      // Fallback to tracks
+      return await this.fetchAllUsersFromTracks();
+    }
+  },
+
+  async get(userId: string): Promise<User | null> {
+    try {
+      const response = await mobileApi.get(`/api/base44/entities/User/${userId}`);
+      return response.data;
+    } catch (error) {
+      console.error('[Users] Error getting user:', error);
+      return null;
+    }
+  },
+
+  async searchProducersAndLabels(query: string): Promise<User[]> {
+    try {
+      const response = await mobileApi.get(
+        `/api/base44/entities/User?search=${encodeURIComponent(query)}&user_type_in=producer,label,dj_producer`
+      );
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[Users] Error searching producers/labels:', error);
+      return [];
+    }
+  },
+};
+
+// ==================== PLAYLISTS SERVICE ====================
+
+export const base44Playlists = {
+  async list(userId?: string): Promise<Playlist[]> {
+    try {
+      console.log('[Playlists] Fetching playlists via native API for user:', userId);
+      // Try native API first
+      const response = await mobileApi.post('/api/playlists', {
+        limit: 100,
+        offset: 0,
+        user_id: userId // Filter by user
+      });
+      
+      // Handle different response formats
+      let playlists: Playlist[] = [];
+      if (response.data?.success && response.data?.playlists) {
+        playlists = response.data.playlists;
+      } else if (Array.isArray(response.data)) {
+        playlists = response.data;
+      } else if (response.data?.items) {
+        playlists = response.data.items;
+      }
+      
+      // Filter by user if userId provided and API didn't filter
+      if (userId && playlists.length > 0) {
+        playlists = playlists.filter(p => 
+          p.created_by === userId || 
+          p.user_id === userId ||
+          p.owner_id === userId
+        );
+      }
+      
+      if (playlists.length > 0) return playlists;
+      
+      // Fallback to Base44 entities with user filter
+      console.log('[Playlists] Native API failed, trying Base44 entities...');
+      const query = userId ? `created_by=${userId}` : '';
+      const fallbackResponse = await mobileApi.get(`/api/base44/entities/Playlist?limit=100&${query}`);
+      const data = fallbackResponse.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[Playlists] Error listing playlists:', error);
+      // Fallback to Base44 entities
+      try {
+        const query = userId ? `created_by=${userId}` : '';
+        const fallbackResponse = await mobileApi.get(`/api/base44/entities/Playlist?limit=100&${query}`);
+        const data = fallbackResponse.data;
+        let playlists: Playlist[] = [];
+        if (Array.isArray(data)) playlists = data;
+        else if (data?.items) playlists = data.items;
+        
+        // Filter by user if needed
+        if (userId && playlists.length > 0) {
+          playlists = playlists.filter(p => 
+            p.created_by === userId || 
+            p.user_id === userId ||
+            p.owner_id === userId
+          );
+        }
+        return playlists;
+      } catch (e) {
+        console.error('[Playlists] Fallback also failed:', e);
+      }
+      return [];
+    }
+  },
+
+  async create(playlist: Partial<Playlist>): Promise<Playlist | null> {
+    try {
+      // Try native create first, fallback to Base44
+      const response = await mobileApi.post('/api/base44/entities/Playlist', playlist);
+      return response.data;
+    } catch (error) {
+      console.error('[Playlists] Error creating playlist:', error);
+      throw error;
+    }
+  },
+
+  async update(playlistId: string, updates: Partial<Playlist>): Promise<Playlist | null> {
+    try {
+      const response = await mobileApi.put(`/api/base44/entities/Playlist/${playlistId}`, updates);
+      return response.data;
+    } catch (error) {
+      console.error('[Playlists] Error updating playlist:', error);
+      throw error;
+    }
+  },
+
+  async addTrack(playlistId: string, trackId: string): Promise<any> {
+    try {
+      const response = await mobileApi.post('/api/base44/functions/invoke/add_to_playlist', {
+        playlist_id: playlistId,
+        track_id: trackId,
+      });
+      return response.data;
+    } catch (error) {
+      console.error('[Playlists] Error adding track to playlist:', error);
+      throw error;
+    }
+  },
+
+  async removeTrack(playlistId: string, trackId: string): Promise<any> {
+    try {
+      const response = await mobileApi.post('/api/base44/functions/invoke/remove_from_playlist', {
+        playlist_id: playlistId,
+        track_id: trackId,
+      });
+      return response.data;
+    } catch (error) {
+      console.error('[Playlists] Error removing track from playlist:', error);
+      throw error;
+    }
+  },
+};
+
+// ==================== FILES SERVICE ====================
+
+export const base44Files = {
+  async upload(fileUri: string, fileName: string, mimeType?: string, authToken?: string): Promise<any> {
+    try {
+      console.log('[Files] Starting upload with Base44 SDK:', { fileName, fileUri: fileUri.substring(0, 100) });
+      
+      // Determine mime type from file name if not provided
+      const actualMimeType = mimeType || getMimeType(fileName);
+      
+      // Get auth token from storage if not provided
+      let token = authToken;
+      if (!token) {
+        try {
+          token = await AsyncStorage.getItem(AUTH_TOKEN_KEY) || '';
+        } catch (e) {
+          console.log('[Files] Could not get token from storage');
+        }
+      }
+      
+      // Convert file to base64
+      let base64Data = '';
+      try {
+        console.log('[Files] Converting file to base64...');
+        const response = await fetch(fileUri);
+        const blob = await response.blob();
+        
+        base64Data = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const result = reader.result as string;
+            // Keep the full data URL for the function
+            resolve(result);
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+        
+        console.log('[Files] File converted to base64, length:', base64Data.length);
+      } catch (readError) {
+        console.error('[Files] Could not convert to base64:', readError);
+        throw new Error('Failed to read file');
+      }
+      
+      // Use Base44 SDK to call the function
+      if (base64Data) {
+        console.log('[Files] Token available:', token ? 'YES (length: ' + token.length + ')' : 'NO');
+        console.log('[Files] Token preview:', token ? token.substring(0, 50) + '...' : 'none');
+        console.log('[Files] Creating Base44 client...');
+        
+        // Use full app ID instead of slug
+        const base44 = createClient({
+          appId: '691a4d96d819355b52c063f3',
+          token: token || undefined,
+        });
+        
+        console.log('[Files] Base44 client created');
+        console.log('[Files] Payload: filename=', fileName, 'mimeType=', actualMimeType, 'base64Length=', base64Data.length);
+        console.log('[Files] Calling functions.invoke now...');
+        
+        try {
+          const result = await base44.functions.invoke('publicUploadTrack', {
+            file: base64Data,
+            filename: fileName,
+            mimeType: actualMimeType,
+          });
+          
+          console.log('[Files] Upload result (full):', JSON.stringify(result, null, 2));
+          console.log('[Files] Result keys:', result ? Object.keys(result) : 'null');
+          
+          // Try to find file URL in various possible response formats
+          const fileUrl = result?.file_url || result?.fileUrl || result?.url || 
+                         result?.data?.file_url || result?.data?.url ||
+                         result?.result?.file_url || result?.result?.url;
+          
+          if (fileUrl) {
+            console.log('[Files] Found file URL:', fileUrl);
+            return { file_url: fileUrl, success: true, ...result };
+          } else {
+            console.log('[Files] No file URL found in result:', result);
+            // If upload succeeded but no URL, construct one
+            if (result?.success || result?.filename || result?.file_id) {
+              const constructedUrl = `https://base44.app/api/apps/691a4d96d819355b52c063f3/files/public/691a4d96d819355b52c063f3/${result.filename || result.file_id || fileName}`;
+              console.log('[Files] Constructed URL:', constructedUrl);
+              return { file_url: constructedUrl, success: true, ...result };
+            }
+            throw new Error('No file URL in response');
+          }
+        } catch (invokeError: any) {
+          console.error('[Files] SDK invoke error:', invokeError);
+          console.error('[Files] Error message:', invokeError.message);
+          console.error('[Files] Error response:', invokeError.response?.data);
+          throw invokeError;
+        }
+      } else {
+        throw new Error('No file data to upload');
+      }
+    } catch (error) {
+      console.error('[Files] Error uploading file:', error);
+      throw error;
+    }
+  },
+
+  getUrl(fileId: string): string {
+    const BASE44_APP_ID = '691a4d96d819355b52c063f3';
+    return `https://base44.app/api/apps/${BASE44_APP_ID}/files/public/${BASE44_APP_ID}/${fileId}`;
+  },
+};
+
+// Helper function to get MIME type from filename
+function getMimeType(fileName: string): string {
+  const ext = fileName.split('.').pop()?.toLowerCase() || '';
+  const mimeTypes: Record<string, string> = {
+    'mp3': 'audio/mpeg',
+    'wav': 'audio/wav',
+    'flac': 'audio/flac',
+    'aac': 'audio/aac',
+    'm4a': 'audio/mp4',
+    'ogg': 'audio/ogg',
+    'jpg': 'image/jpeg',
+    'jpeg': 'image/jpeg',
+    'png': 'image/png',
+    'gif': 'image/gif',
+    'webp': 'image/webp',
+  };
+  return mimeTypes[ext] || 'application/octet-stream';
+}
+
+// ==================== ADMIN SERVICE ====================
+
+export const base44Admin = {
+  /**
+   * Add Black Diamonds to a user
+   * Calls the Base44 giveBlackDiamonds cloud function
+   */
+  async addDiamonds(email: string, amount: number): Promise<any> {
+    try {
+      console.log('[Admin] Adding', amount, 'diamonds to user:', email);
+      
+      // Call the Base44 function directly
+      const response = await fetch(
+        `https://spynners.base44.app/api/apps/691a4d96d819355b52c063f3/functions/invoke/giveBlackDiamonds`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, amount }),
+        }
+      );
+      
+      const data = await response.json();
+      console.log('[Admin] addDiamonds response:', data);
+      return data;
+    } catch (error) {
+      console.error('[Admin] Error adding diamonds:', error);
+      throw error;
+    }
+  },
+
+  async getPendingTracks(): Promise<Track[]> {
+    try {
+      const response = await mobileApi.get('/api/base44/entities/Track?status=pending');
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[Admin] Error getting pending tracks:', error);
+      return [];
+    }
+  },
+
+  async approveTrack(trackId: string): Promise<any> {
+    try {
+      console.log('[Admin] Calling approve endpoint for track:', trackId);
+      const response = await mobileApi.put(`/api/admin/tracks/${trackId}/approve`);
+      return response.data;
+    } catch (error) {
+      console.error('[Admin] Error approving track:', error);
+      throw error;
+    }
+  },
+
+  async rejectTrack(trackId: string, reason?: string): Promise<any> {
+    try {
+      console.log('[Admin] Rejecting track via Base44:', trackId);
+      // Update the track status directly via Base44 entity API
+      const response = await mobileApi.put(`/api/base44/entities/Track/${trackId}`, {
+        status: 'rejected',
+        rejection_reason: reason || 'Rejeté par l\'admin',
+        rejected_at: new Date().toISOString(),
+      });
+      return response.data;
+    } catch (error) {
+      console.error('[Admin] Error rejecting track:', error);
+      throw error;
+    }
+  },
+
+  async getAllUsers(): Promise<User[]> {
+    try {
+      const response = await mobileApi.get('/api/base44/entities/User');
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[Admin] Error getting all users:', error);
+      return [];
+    }
+  },
+
+  async getAnalytics(): Promise<any> {
+    try {
+      const response = await mobileApi.post('/api/base44/functions/invoke/get_analytics', {});
+      return response.data;
+    } catch (error) {
+      console.error('[Admin] Error getting analytics:', error);
+      return null;
+    }
+  },
+
+  async getDownloadStats(): Promise<any> {
+    try {
+      const response = await mobileApi.post('/api/base44/functions/invoke/get_download_stats', {});
+      return response.data;
+    } catch (error) {
+      console.error('[Admin] Error getting download stats:', error);
+      return null;
+    }
+  },
+
+  // ==================== NEW ADMIN API - getAdminData ====================
+  
+  /**
+   * Get complete admin dashboard data
+   * Requires admin role ("admin" or "admin_readonly")
+   */
+  async getDashboard(): Promise<any> {
+    try {
+      console.log('[Admin] Fetching dashboard data...');
+      const response = await mobileApi.post('/api/base44/functions/invoke/getAdminData', {});
+      console.log('[Admin] Dashboard data fetched:', response.data);
+      return response.data;
+    } catch (error) {
+      console.error('[Admin] Error getting dashboard:', error);
+      return null;
+    }
+  },
+
+  /**
+   * Get specific section of admin data
+   * @param section - One of: pending_tracks, vip_requests, approved_tracks, users, sessions, downloads, vip_promos, broadcasts, dj_categories, forum_posts
+   */
+  async getSection(section: string): Promise<any> {
+    try {
+      console.log('[Admin] Fetching section:', section);
+      const response = await mobileApi.post('/api/base44/functions/invoke/getAdminData', {
+        section,
+      });
+      console.log('[Admin] Section data fetched:', response.data);
+      return response.data;
+    } catch (error) {
+      console.error('[Admin] Error getting section:', section, error);
+      return null;
+    }
+  },
+
+  /**
+   * Get pending tracks for approval
+   */
+  async getPendingTracksNew(): Promise<any> {
+    return this.getSection('pending_tracks');
+  },
+
+  /**
+   * Get VIP requests
+   */
+  async getVipRequests(): Promise<any> {
+    return this.getSection('vip_requests');
+  },
+
+  /**
+   * Get all users
+   */
+  async getAllUsersNew(): Promise<any> {
+    return this.getSection('users');
+  },
+
+  /**
+   * Get SPYN sessions
+   */
+  async getSessions(): Promise<any> {
+    return this.getSection('sessions');
+  },
+
+  /**
+   * Get downloads data
+   */
+  async getDownloads(): Promise<any> {
+    return this.getSection('downloads');
+  },
+
+  /**
+   * Get VIP promos
+   */
+  async getVipPromos(): Promise<any> {
+    return this.getSection('vip_promos');
+  },
+
+  /**
+   * Get broadcast emails
+   */
+  async getBroadcasts(): Promise<any> {
+    return this.getSection('broadcasts');
+  },
+
+  /**
+   * Get DJ categories
+   */
+  async getDjCategories(): Promise<any> {
+    return this.getSection('dj_categories');
+  },
+
+  /**
+   * Get pending forum posts
+   */
+  async getForumPosts(): Promise<any> {
+    return this.getSection('forum_posts');
+  },
+};
+
+// ==================== SPYN NOTIFICATION SERVICE ====================
+
+export const base44Notifications = {
+  /**
+   * Send email to producer when their track is played
+   * Uses Base44 integrations.Core.SendEmail
+   */
+  async sendTrackPlayedEmail(params: {
+    track_id: string;
+    track_title: string;
+    artist_name: string;
+    dj_name: string;
+    club_name?: string;
+    location?: string;
+    played_at?: string;
+  }): Promise<any> {
+    try {
+      console.log('[Notifications] Sending track played email:', params);
+      
+      // First, try to call the sendTrackPlayedEmail cloud function
+      // This function should handle finding the producer's email and sending
+      const response = await mobileApi.post('/api/base44/functions/invoke/sendTrackPlayedEmail', {
+        trackTitle: params.track_title,
+        artistName: params.artist_name,
+        djName: params.dj_name,
+        clubName: params.club_name || 'Unknown Venue',
+        location: params.location || 'Unknown Location',
+        playedAt: params.played_at || new Date().toISOString(),
+      });
+      
+      console.log('[Notifications] Email sent successfully:', response.data);
+      return response.data;
+    } catch (error) {
+      console.error('[Notifications] Error sending track played email:', error);
+      
+      // Fallback: Create a notification record in the database
+      try {
+        await mobileApi.post('/api/base44/entities/Notification', {
+          type: 'track_played',
+          message: `Your track "${params.track_title}" was played by ${params.dj_name} at ${params.club_name || 'a venue'}`,
+          track_title: params.track_title,
+          dj_name: params.dj_name,
+          read: false,
+          created_at: new Date().toISOString(),
+        });
+        console.log('[Notifications] Created notification record as fallback');
+      } catch (e) {
+        console.log('[Notifications] Could not create fallback notification');
+      }
+      
+      throw error;
+    }
+  },
+
+  async getLiveTrackPlays(producerId?: string): Promise<any[]> {
+    try {
+      console.log('[LiveRadar] Fetching live track plays for producer:', producerId || 'all');
+      
+      // Try native API first
+      try {
+        const response = await mobileApi.post('/api/live-plays', {
+          producer_id: producerId || null,
+          limit: 100
+        });
+        console.log('[LiveRadar] Native API response:', response.data);
+        
+        if (response.data?.plays) {
+          return response.data.plays;
+        }
+        if (Array.isArray(response.data)) {
+          return response.data;
+        }
+      } catch (nativeError) {
+        console.log('[LiveRadar] Native API failed, trying Base44...');
+      }
+      
+      // Fallback to Base44 function
+      const response = await mobileApi.post('/api/base44/functions/invoke/getLiveTrackPlays', {
+        producerId: producerId || null,
+      });
+      console.log('[LiveRadar] Live plays fetched:', response.data);
+      
+      // Handle different response formats
+      if (Array.isArray(response.data)) {
+        return response.data;
+      }
+      if (response.data?.plays) {
+        return response.data.plays;
+      }
+      if (response.data?.data) {
+        return response.data.data;
+      }
+      return [];
+    } catch (error) {
+      console.error('[LiveRadar] Error fetching live track plays:', error);
+      return [];
+    }
+  },
+};
+
+// ==================== VIP SERVICE ====================
+
+export interface VIPPromo {
+  id?: string;
+  _id?: string;
+  name: string;
+  description?: string;
+  track_ids?: string[];
+  price?: number;
+  duration_days?: number;
+  is_active?: boolean;
+  created_at?: string;
+}
+
+export interface VIPPurchase {
+  id?: string;
+  _id?: string;
+  user_id: string;
+  promo_id: string;
+  purchased_at: string;
+  expires_at?: string;
+  amount?: number;
+}
+
+export interface VIPDownload {
+  id?: string;
+  _id?: string;
+  user_id: string;
+  track_id: string;
+  downloaded_at: string;
+}
+
+export const base44VIP = {
+  // VIP Promos
+  async listPromos(): Promise<VIPPromo[]> {
+    try {
+      const response = await mobileApi.get('/api/base44/entities/VIPPromo?limit=100');
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[VIP] Error listing promos:', error);
+      return [];
+    }
+  },
+
+  async getPromo(promoId: string): Promise<VIPPromo | null> {
+    try {
+      const response = await mobileApi.get(`/api/base44/entities/VIPPromo/${promoId}`);
+      return response.data;
+    } catch (error) {
+      console.error('[VIP] Error getting promo:', error);
+      return null;
+    }
+  },
+
+  // VIP Purchases
+  async listMyPurchases(userId: string): Promise<VIPPurchase[]> {
+    try {
+      console.log('[VIP listMyPurchases] Fetching for userId:', userId);
+      
+      // On mobile, we need to call Base44 directly for VIPPurchase entity
+      const isMobile = Platform.OS !== 'web';
+      let response;
+      
+      if (isMobile) {
+        // Direct Base44 API call on mobile
+        const url = `/entities/VIPPurchase?user_id=${userId}`;
+        console.log('[VIP listMyPurchases] Mobile - calling Base44 directly:', url);
+        response = await mobileApi.get(url);
+      } else {
+        // Via backend proxy on web
+        const url = `/api/base44/entities/VIPPurchase?user_id=${userId}`;
+        console.log('[VIP listMyPurchases] Web - calling via backend:', url);
+        response = await mobileApi.get(url);
+      }
+      
+      console.log('[VIP listMyPurchases] Response status:', response.status);
+      console.log('[VIP listMyPurchases] Response data:', JSON.stringify(response.data).substring(0, 500));
+      
+      const data = response.data;
+      if (Array.isArray(data)) {
+        console.log('[VIP listMyPurchases] Returning array of', data.length, 'purchases');
+        return data;
+      }
+      if (data?.items) {
+        console.log('[VIP listMyPurchases] Returning items array of', data.items.length, 'purchases');
+        return data.items;
+      }
+      console.log('[VIP listMyPurchases] No valid data, returning empty array');
+      return [];
+    } catch (error) {
+      console.error('[VIP listMyPurchases] Error:', error);
+      return [];
+    }
+  },
+
+  async createPurchase(purchase: Partial<VIPPurchase>): Promise<VIPPurchase | null> {
+    try {
+      const response = await mobileApi.post('/api/base44/entities/VIPPurchase', purchase);
+      return response.data;
+    } catch (error) {
+      console.error('[VIP] Error creating purchase:', error);
+      throw error;
+    }
+  },
+
+  // VIP Downloads
+  async recordDownload(download: Partial<VIPDownload>): Promise<VIPDownload | null> {
+    try {
+      const response = await mobileApi.post('/api/base44/entities/VIPDownload', download);
+      return response.data;
+    } catch (error) {
+      console.error('[VIP] Error recording download:', error);
+      throw error;
+    }
+  },
+
+  async listMyDownloads(userId: string): Promise<VIPDownload[]> {
+    try {
+      const response = await mobileApi.get(`/api/base44/entities/VIPDownload?user_id=${userId}`);
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[VIP] Error listing downloads:', error);
+      return [];
+    }
+  },
+};
+
+// ==================== MESSAGE SERVICE ====================
+
+export interface Message {
+  id?: string;
+  _id?: string;
+  sender_id: string;
+  sender_name?: string;
+  receiver_id: string;
+  content?: string;
+  audio_url?: string;
+  attachment_urls?: string[];
+  read?: boolean;
+  created_at?: string;
+}
+
+export const base44Messages = {
+  async list(filters?: { receiver_id?: string; sender_id?: string; read?: boolean }): Promise<Message[]> {
+    try {
+      const params = new URLSearchParams();
+      params.append('limit', '200');
+      if (filters?.receiver_id) params.append('receiver_id', filters.receiver_id);
+      if (filters?.sender_id) params.append('sender_id', filters.sender_id);
+      if (filters?.read !== undefined) params.append('read', filters.read.toString());
+
+      const response = await mobileApi.get(`/api/base44/entities/Message?${params.toString()}`);
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[Messages] Error listing messages:', error);
+      return [];
+    }
+  },
+
+  async getUnreadCount(userId: string): Promise<number> {
+    try {
+      const messages = await this.list({ receiver_id: userId, read: false });
+      return messages.length;
+    } catch (error) {
+      console.error('[Messages] Error getting unread count:', error);
+      return 0;
+    }
+  },
+
+  async send(message: Partial<Message>): Promise<Message | null> {
+    try {
+      const response = await mobileApi.post('/api/base44/entities/Message', {
+        ...message,
+        read: false,
+        created_at: new Date().toISOString(),
+      });
+      return response.data;
+    } catch (error) {
+      console.error('[Messages] Error sending message:', error);
+      throw error;
+    }
+  },
+
+  async markAsRead(messageId: string): Promise<Message | null> {
+    try {
+      const response = await mobileApi.put(`/api/base44/entities/Message/${messageId}`, {
+        read: true,
+      });
+      return response.data;
+    } catch (error) {
+      console.error('[Messages] Error marking message as read:', error);
+      throw error;
+    }
+  },
+
+  async getConversation(userId1: string, userId2: string): Promise<Message[]> {
+    try {
+      // Get all messages between two users
+      const allMessages = await this.list();
+      return allMessages.filter((msg: Message) => 
+        (msg.sender_id === userId1 && msg.receiver_id === userId2) ||
+        (msg.sender_id === userId2 && msg.receiver_id === userId1)
+      ).sort((a, b) => 
+        new Date(a.created_at || '').getTime() - new Date(b.created_at || '').getTime()
+      );
+    } catch (error) {
+      console.error('[Messages] Error getting conversation:', error);
+      return [];
+    }
+  },
+};
+
+// ==================== TRACK SEND SERVICE ====================
+// Used for sending tracks internally between users
+
+export interface TrackSend {
+  id?: string;
+  _id?: string;
+  track_id: string;
+  track_title?: string;
+  track_producer_name?: string;
+  track_artwork_url?: string;
+  track_genre?: string;
+  sender_id: string;
+  sender_name?: string;
+  sender_avatar?: string;
+  receiver_id: string;
+  receiver_name?: string;
+  message?: string;
+  viewed: boolean;
+  created_at?: string;
+}
+
+export const base44TrackSend = {
+  /**
+   * Send a track to another user
+   */
+  async create(data: Omit<TrackSend, 'id' | '_id' | 'created_at'>): Promise<TrackSend | null> {
+    try {
+      console.log('[TrackSend] Creating track send:', data.track_title, 'to', data.receiver_name);
+      const response = await mobileApi.post('/api/base44/entities/TrackSend', {
+        ...data,
+        viewed: false,
+        created_at: new Date().toISOString(),
+      });
+      console.log('[TrackSend] Track sent successfully');
+      return response.data;
+    } catch (error) {
+      console.error('[TrackSend] Error sending track:', error);
+      throw error;
+    }
+  },
+
+  /**
+   * Get tracks received by a user
+   */
+  async getReceived(userId: string): Promise<TrackSend[]> {
+    try {
+      console.log('[TrackSend] Loading received tracks for user:', userId);
+      const response = await mobileApi.get(`/api/base44/entities/TrackSend?receiver_id=${userId}&limit=100`);
+      const data = response.data;
+      let tracks: TrackSend[] = [];
+      if (Array.isArray(data)) tracks = data;
+      else if (data?.items) tracks = data.items;
+      
+      // Sort by created_at descending (newest first)
+      tracks.sort((a, b) => {
+        const dateA = new Date(a.created_at || 0).getTime();
+        const dateB = new Date(b.created_at || 0).getTime();
+        return dateB - dateA;
+      });
+      
+      console.log('[TrackSend] Loaded', tracks.length, 'received tracks');
+      return tracks;
+    } catch (error) {
+      console.error('[TrackSend] Error getting received tracks:', error);
+      return [];
+    }
+  },
+
+  /**
+   * Get tracks sent by a user
+   */
+  async getSent(userId: string): Promise<TrackSend[]> {
+    try {
+      const response = await mobileApi.get(`/api/base44/entities/TrackSend?sender_id=${userId}&limit=100`);
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[TrackSend] Error getting sent tracks:', error);
+      return [];
+    }
+  },
+
+  /**
+   * Mark a track as viewed
+   */
+  async markAsViewed(trackSendId: string): Promise<boolean> {
+    try {
+      await mobileApi.put(`/api/base44/entities/TrackSend/${trackSendId}`, {
+        viewed: true,
+      });
+      return true;
+    } catch (error) {
+      console.error('[TrackSend] Error marking as viewed:', error);
+      return false;
+    }
+  },
+
+  /**
+   * Get unviewed count
+   */
+  async getUnviewedCount(userId: string): Promise<number> {
+    try {
+      const received = await this.getReceived(userId);
+      return received.filter(t => !t.viewed).length;
+    } catch (error) {
+      return 0;
+    }
+  },
+};
+
+// ==================== NOTIFICATION SERVICE ====================
+
+export interface Notification {
+  id?: string;
+  _id?: string;
+  user_id: string;
+  type: 'track_played' | 'message' | 'follow' | 'download' | 'vip' | 'system' | string;
+  message: string;
+  read: boolean;
+  track_id?: string;
+  track_title?: string;
+  dj_id?: string;
+  dj_name?: string;
+  sender_id?: string;
+  sender_name?: string;
+  created_at?: string;
+}
+
+export const base44Notifications2 = {
+  async list(userId: string): Promise<Notification[]> {
+    try {
+      const response = await mobileApi.get(`/api/base44/entities/Notification?user_id=${userId}&limit=50`);
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[Notifications] Error listing notifications:', error);
+      return [];
+    }
+  },
+
+  async getUnread(userId: string): Promise<Notification[]> {
+    try {
+      const response = await mobileApi.get(`/api/base44/entities/Notification?user_id=${userId}&read=false&limit=50`);
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error: any) {
+      // Silently handle errors - don't spam console with notification errors
+      // Rate limit errors (429) are expected when making many requests
+      if (error?.response?.status !== 429) {
+        console.log('[Notifications] Could not fetch notifications');
+      }
+      return [];
+    }
+  },
+
+  async getUnreadCount(userId: string): Promise<number> {
+    try {
+      const notifications = await this.getUnread(userId);
+      return notifications.length;
+    } catch (error) {
+      console.error('[Notifications] Error getting unread count:', error);
+      return 0;
+    }
+  },
+
+  async markAsRead(notificationId: string): Promise<Notification | null> {
+    try {
+      const response = await mobileApi.put(`/api/base44/entities/Notification/${notificationId}`, {
+        read: true,
+      });
+      return response.data;
+    } catch (error) {
+      console.error('[Notifications] Error marking notification as read:', error);
+      return null;
+    }
+  },
+
+  async markAllAsRead(userId: string): Promise<void> {
+    try {
+      const unread = await this.getUnread(userId);
+      await Promise.all(unread.map(n => this.markAsRead(n.id || n._id || '')));
+    } catch (error) {
+      console.error('[Notifications] Error marking all as read:', error);
+    }
+  },
+
+  async delete(notificationId: string): Promise<boolean> {
+    try {
+      await mobileApi.delete(`/api/base44/entities/Notification/${notificationId}`);
+      return true;
+    } catch (error) {
+      console.error('[Notifications] Error deleting notification:', error);
+      return false;
+    }
+  },
+
+  async create(notification: Partial<Notification>): Promise<Notification | null> {
+    try {
+      const response = await mobileApi.post('/api/base44/entities/Notification', {
+        ...notification,
+        read: false,
+        created_at: new Date().toISOString(),
+      });
+      return response.data;
+    } catch (error) {
+      console.error('[Notifications] Error creating notification:', error);
+      return null;
+    }
+  },
+};
+
+// ==================== SPYN FUNCTIONS (ACRCloud, Places, Diamonds) ====================
+
+// Helper to get auth token for SPYN functions
+const getSpynAuthToken = async (): Promise<string | null> => {
+  try {
+    const token = await AsyncStorage.getItem('auth_token');
+    return token;
+  } catch (e) {
+    console.log('[base44Spyn] Could not get auth token:', e);
+    return null;
+  }
+};
+
+export const base44Spyn = {
+  /**
+   * Recognize audio using ACRCloud via Base44
+   */
+  async recognizeAudio(params: {
+    audio_data: string;
+    sample_rate?: number;
+    channels?: number;
+    location?: any;
+    dj_id?: string;
+    dj_name?: string;
+  }): Promise<any> {
+    try {
+      console.log('[base44Spyn] Calling recognizeAudio function...');
+      
+      const token = await getSpynAuthToken();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      
+      const response = await fetch(
+        `https://spynners.base44.app/api/functions/recognizeAudio`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            audio_data: params.audio_data,
+            sample_rate: params.sample_rate || 44100,
+            channels: params.channels || 1,
+            location: params.location,
+            dj_id: params.dj_id,
+            dj_name: params.dj_name,
+          }),
+        }
+      );
+      
+      const data = await response.json();
+      console.log('[base44Spyn] recognizeAudio response:', data);
+      return data;
+    } catch (error) {
+      console.error('[base44Spyn] recognizeAudio error:', error);
+      throw error;
+    }
+  },
+
+  /**
+   * Get nearby places (clubs, bars) using Google Places via Base44
+   */
+  async getNearbyPlaces(params: {
+    latitude: number;
+    longitude: number;
+    radius?: number;
+  }): Promise<any> {
+    try {
+      console.log('[base44Spyn] Calling getNearbyPlaces function...');
+      
+      const token = await getSpynAuthToken();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      
+      const response = await fetch(
+        `https://spynners.base44.app/api/functions/getNearbyPlaces`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            latitude: params.latitude,
+            longitude: params.longitude,
+            radius: params.radius || 1000,
+          }),
+        }
+      );
+      
+      const data = await response.json();
+      console.log('[base44Spyn] getNearbyPlaces response:', data);
+      return data;
+    } catch (error) {
+      console.error('[base44Spyn] getNearbyPlaces error:', error);
+      throw error;
+    }
+  },
+
+  /**
+   * Award Black Diamond to producer when their track is played
+   */
+  async awardDiamond(params: {
+    producer_email: string;
+    track_title: string;
+    dj_name: string;
+    venue?: string;
+    city?: string;
+    country?: string;
+  }): Promise<any> {
+    try {
+      console.log('[base44Spyn] Calling awardDiamond function...');
+      
+      const token = await getSpynAuthToken();
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      
+      const response = await fetch(
+        `https://spynners.base44.app/api/functions/awardDiamond`,
+        {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({
+            producer_email: params.producer_email,
+            track_title: params.track_title,
+            dj_name: params.dj_name,
+            venue: params.venue || '',
+            city: params.city || '',
+            country: params.country || '',
+          }),
+        }
+      );
+      
+      const data = await response.json();
+      console.log('[base44Spyn] awardDiamond response:', data);
+      return data;
+    } catch (error) {
+      console.error('[base44Spyn] awardDiamond error:', error);
+      throw error;
+    }
+  },
+};
+
+// ==================== PUSH NOTIFICATIONS SERVICE ====================
+
+export const base44PushNotifications = {
+  /**
+   * Register a push token for the current user
+   * This allows the user to receive push notifications on their device
+   */
+  async registerPushToken(userId: string, pushToken: string): Promise<boolean> {
+    try {
+      console.log('[PushNotifications] Registering push token for user:', userId);
+      console.log('[PushNotifications] Token:', pushToken.substring(0, 50) + '...');
+      
+      // Call the Base44 function to save the push token
+      const response = await mobileApi.post('/api/base44/functions/invoke/registerPushToken', {
+        user_id: userId,
+        push_token: pushToken,
+      });
+      
+      console.log('[PushNotifications] Token registered successfully:', response.data);
+      return true;
+    } catch (error: any) {
+      console.error('[PushNotifications] Error registering push token:', error?.message || error);
+      
+      // Fallback: Try to update the User entity directly
+      try {
+        console.log('[PushNotifications] Trying direct entity update...');
+        await mobileApi.put(`/api/base44/entities/User/${userId}`, {
+          push_token: pushToken,
+        });
+        console.log('[PushNotifications] Direct update successful');
+        return true;
+      } catch (fallbackError) {
+        console.error('[PushNotifications] Fallback also failed:', fallbackError);
+        return false;
+      }
+    }
+  },
+
+  /**
+   * Send a push notification to a specific user
+   * Called when sending a message to trigger notification on recipient's device
+   */
+  async sendPushNotification(params: {
+    recipientUserId: string;
+    senderName: string;
+    messageContent: string;
+    messageId?: string;
+  }): Promise<boolean> {
+    try {
+      console.log('[PushNotifications] Sending push notification to user:', params.recipientUserId);
+      
+      // Call the Base44 function to send the push notification
+      const response = await mobileApi.post('/api/base44/functions/invoke/sendPushNotification', {
+        recipient_user_id: params.recipientUserId,
+        sender_name: params.senderName,
+        message_content: params.messageContent,
+        message_id: params.messageId || '',
+      });
+      
+      console.log('[PushNotifications] Notification sent:', response.data);
+      return true;
+    } catch (error: any) {
+      console.error('[PushNotifications] Error sending notification:', error?.message || error);
+      return false;
+    }
+  },
+
+  /**
+   * Remove push token (on logout)
+   */
+  async removePushToken(userId: string): Promise<boolean> {
+    try {
+      console.log('[PushNotifications] Removing push token for user:', userId);
+      
+      await mobileApi.put(`/api/base44/entities/User/${userId}`, {
+        push_token: null,
+      });
+      
+      console.log('[PushNotifications] Token removed');
+      return true;
+    } catch (error) {
+      console.error('[PushNotifications] Error removing token:', error);
+      return false;
+    }
+  },
+};
+
+// ==================== PUBLIC PROFILES SERVICE ====================
+
+export const base44Profiles = {
+  /**
+   * Get a single user's public profile by ID with real stats
+   */
+  async getProfile(userId: string): Promise<PublicProfile | null> {
+    try {
+      console.log('[Profiles] ========== FETCHING PROFILE ==========');
+      console.log('[Profiles] User ID:', userId);
+      console.log('[Profiles] Platform:', Platform.OS);
+      
+      // Fetch user data first
+      let userData: any = null;
+      try {
+        const userResponse = await mobileApi.get(`/api/base44/entities/User/${userId}`);
+        userData = userResponse.data;
+        console.log('[Profiles] User data fetched:', userData?.full_name || userData?.email);
+      } catch (userError) {
+        console.log('[Profiles] Could not fetch user entity:', userError);
+      }
+      
+      // Fetch ALL tracks and filter for this user's tracks
+      let tracksCount = 0;
+      let totalPlays = 0;
+      let totalDownloads = 0;
+      
+      try {
+        console.log('[Profiles] Fetching all tracks to calculate stats...');
+        const tracksResponse = await mobileApi.get(`/api/base44/entities/Track?limit=1000`);
+        
+        if (Array.isArray(tracksResponse.data)) {
+          const allTracks = tracksResponse.data;
+          console.log('[Profiles] Total tracks in database:', allTracks.length);
+          
+          // Log sample track to understand structure
+          if (allTracks.length > 0) {
+            const sample = allTracks[0];
+            console.log('[Profiles] Sample track IDs:', {
+              created_by_id: sample.created_by_id,
+              producer_id: sample.producer_id,
+              uploaded_by: sample.uploaded_by,
+            });
+          }
+          
+          // CRITICAL: Filter tracks where user is the REAL PRODUCER
+          // Only count approved tracks (not rejected/pending)
+          const myTracks = allTracks.filter((t: any) => {
+            const producerId = String(t.producer_id || '').trim();
+            const targetId = String(userId).trim();
+            
+            // First check: producer_id must match
+            if (producerId !== targetId) {
+              return false;
+            }
+            
+            // Second check: status must be "approved" (not rejected/pending)
+            const status = String(t.status || '').toLowerCase();
+            if (status !== 'approved') {
+              return false;
+            }
+            
+            console.log('[Profiles] ✓ My production:', t.title);
+            return true;
+          });
+          
+          tracksCount = myTracks.length;
+          totalPlays = myTracks.reduce((sum: number, t: any) => sum + (t.play_count || 0), 0);
+          totalDownloads = myTracks.reduce((sum: number, t: any) => sum + (t.download_count || 0), 0);
+          
+          console.log('[Profiles] ========== STATS RESULT ==========');
+          console.log('[Profiles] MY tracks:', tracksCount, '/', allTracks.length, 'total');
+          console.log('[Profiles] MY plays:', totalPlays);
+          console.log('[Profiles] MY downloads:', totalDownloads);
+        }
+      } catch (tracksError) {
+        console.log('[Profiles] Error fetching tracks for stats:', tracksError);
+      }
+      
+      // Build and return profile
+      const userDataNested = userData?.data || {};
+      
+      return {
+        id: userData?.id || userData?._id || userId,
+        email: userData?.email || '',
+        full_name: userData?.full_name || '',
+        artist_name: userDataNested.artist_name || userData?.artist_name || '',
+        avatar_url: userDataNested.avatar_url || userData?.avatar_url || userData?.generated_avatar_url || '',
+        user_type: userDataNested.user_type || userData?.user_type || 'dj',
+        bio: userDataNested.bio || userData?.bio || '',
+        nationality: userDataNested.nationality || userData?.nationality || '',
+        instagram_url: userDataNested.instagram_url || userData?.instagram_url || '',
+        soundcloud_url: userDataNested.soundcloud || userData?.soundcloud || '',
+        beatport_url: userDataNested.beatport_url || userData?.beatport_url || '',
+        black_diamonds: userDataNested.black_diamonds || userData?.black_diamonds || 0,
+        sacem_number: userDataNested.sacem_number || userData?.sacem_number || '',
+        stats: {
+          tracks_count: tracksCount,
+          total_plays: totalPlays,
+          total_downloads: totalDownloads,
+          followers_count: 0,
+        },
+      };
+    } catch (error) {
+      console.error('[Profiles] Error fetching profile:', error);
+      return null;
+    }
+  },
+
+  /**
+   * List all public profiles with optional filters
+   */
+  async listProfiles(filters?: { userType?: string; limit?: number }): Promise<PublicProfile[]> {
+    try {
+      console.log('[Profiles] Fetching profiles with filters:', filters);
+      
+      // On mobile, fetch directly from User entity
+      if (Platform.OS !== 'web') {
+        const params = new URLSearchParams();
+        params.append('limit', (filters?.limit || 50).toString());
+        if (filters?.userType) params.append('user_type', filters.userType);
+        
+        const response = await mobileApi.get(`/entities/User?${params.toString()}`);
+        if (Array.isArray(response.data)) {
+          console.log('[Profiles] Got', response.data.length, 'profiles from User entity');
+          return response.data.map((user: any) => {
+            const userData = user.data || {};
+            return {
+              id: user.id || user._id,
+              email: user.email,
+              full_name: user.full_name,
+              artist_name: userData.artist_name || user.artist_name,
+              avatar_url: userData.avatar_url || user.avatar_url || user.generated_avatar_url,
+              user_type: userData.user_type || user.user_type,
+              bio: userData.bio || user.bio || '',
+              nationality: userData.nationality || user.nationality,
+              instagram_url: userData.instagram_url || user.instagram_url,
+              soundcloud_url: userData.soundcloud || user.soundcloud,
+              beatport_url: userData.beatport_url || user.beatport_url,
+              black_diamonds: userData.black_diamonds || user.black_diamonds || 0,
+              tracks_count: 0,
+              plays_count: 0,
+              downloads_count: 0,
+            };
+          });
+        }
+        return [];
+      }
+      
+      // On web, use the function
+      const response = await mobileApi.post('/api/base44/functions/invoke/getPublicProfiles', {
+        userType: filters?.userType,
+        limit: filters?.limit || 50,
+      });
+      
+      if (response.data?.success && response.data?.profiles) {
+        console.log('[Profiles] Profiles fetched:', response.data.profiles.length);
+        return response.data.profiles;
+      }
+      
+      return [];
+    } catch (error) {
+      console.error('[Profiles] Error listing profiles:', error);
+      return [];
+    }
+  },
+
+  /**
+   * Get avatar URL - returns the best available avatar
+   */
+  getAvatarUrl(profile: PublicProfile): string | null {
+    if (profile.avatar_url) return profile.avatar_url;
+    if (profile.generated_avatar_url) return profile.generated_avatar_url;
+    return null;
+  },
+
+  /**
+   * Get display name - returns artist_name or full_name
+   */
+  getDisplayName(profile: PublicProfile): string {
+    return profile.artist_name || profile.full_name || 'Unknown';
+  },
+};
+
+// ==================== SESSION TRACK SERVICE ====================
+// Stores tracks detected during a SPYN session
+
+export interface SessionTrack {
+  id?: string;
+  _id?: string;
+  session_mix_id: string;
+  track_id: string;
+  track_title: string;
+  track_artist: string;
+  track_album?: string;
+  track_genre?: string;
+  track_cover?: string;
+  producer_id?: string;
+  producer_email?: string;
+  played_at: string;
+  dj_id: string;
+  dj_name: string;
+  venue?: string;
+  city?: string;
+  country?: string;
+}
+
+export const base44SessionTracks = {
+  /**
+   * Save a detected track for a session
+   */
+  async saveSessionTrack(trackData: Partial<SessionTrack>): Promise<SessionTrack | null> {
+    try {
+      console.log('[SessionTrack] Saving track:', trackData.track_title);
+      const response = await mobileApi.post('/api/base44/entities/SessionTrack', trackData);
+      console.log('[SessionTrack] Track saved successfully');
+      return response.data;
+    } catch (error: any) {
+      // If entity doesn't exist, try creating via direct API
+      console.error('[SessionTrack] Error saving track:', error?.response?.status, error?.message);
+      
+      // Try alternative approach - save to TrackPlay entity
+      try {
+        console.log('[SessionTrack] Trying TrackPlay entity instead...');
+        const response = await mobileApi.post('/api/base44/entities/TrackPlay', {
+          session_mix_id: trackData.session_mix_id,
+          track_id: trackData.track_id,
+          track_title: trackData.track_title,
+          track_artist: trackData.track_artist,
+          album: trackData.track_album,
+          genre: trackData.track_genre,
+          cover_image: trackData.track_cover,
+          producer_id: trackData.producer_id,
+          played_at: trackData.played_at,
+          user_id: trackData.dj_id,
+          dj_name: trackData.dj_name,
+          venue: trackData.venue,
+          city: trackData.city,
+          country: trackData.country,
+        });
+        console.log('[SessionTrack] Saved to TrackPlay successfully');
+        return response.data;
+      } catch (e2) {
+        console.error('[SessionTrack] TrackPlay also failed:', e2);
+        return null;
+      }
+    }
+  },
+
+  /**
+   * Get all tracks for a session
+   */
+  async getSessionTracks(sessionMixId: string): Promise<SessionTrack[]> {
+    try {
+      // Try SessionTrack first
+      try {
+        const response = await mobileApi.get(`/api/base44/entities/SessionTrack?session_mix_id=${sessionMixId}`);
+        const data = response.data;
+        if (Array.isArray(data) && data.length > 0) return data;
+        if (data?.items && data.items.length > 0) return data.items;
+      } catch (e) {
+        // SessionTrack entity might not exist
+      }
+      
+      // Try TrackPlay as fallback
+      const response = await mobileApi.get(`/api/base44/entities/TrackPlay?session_mix_id=${sessionMixId}`);
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[SessionTrack] Error getting session tracks:', error);
+      return [];
+    }
+  },
+
+  /**
+   * Get all track plays (for PDF generation)
+   */
+  async getAllTrackPlays(): Promise<SessionTrack[]> {
+    try {
+      const response = await mobileApi.get('/api/base44/entities/TrackPlay?limit=10000');
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      if (data?.items) return data.items;
+      return [];
+    } catch (error) {
+      console.error('[SessionTrack] Error getting all track plays:', error);
+      return [];
+    }
+  },
+};
+
+// Export default api object
+export default {
+  auth: base44Auth,
+  tracks: base44Tracks,
+  users: base44Users,
+  playlists: base44Playlists,
+  files: base44Files,
+  admin: base44Admin,
+  notifications: base44Notifications,
+  notifications2: base44Notifications2,
+  profiles: base44Profiles,
+};
+
+// Alias for convenience
+export const base44Api = base44Auth;
+
+// Export mobileApi for direct use
+export { mobileApi };
