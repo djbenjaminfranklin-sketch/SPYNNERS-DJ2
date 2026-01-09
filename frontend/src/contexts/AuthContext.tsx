@@ -1,10 +1,22 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import { Platform } from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as Notifications from 'expo-notifications';
+// LAZY IMPORT: expo-notifications is loaded dynamically to prevent iOS native build crashes
+// The TurboModule initialization was causing SIGSEGV crashes at app startup
+// import * as Notifications from 'expo-notifications';
 import * as Device from 'expo-device';
 import Constants from 'expo-constants';
 import { base44Auth, base44Users, base44PushNotifications, User } from '../services/base44Api';
+
+// Helper to get Notifications module lazily - prevents crash on module import
+const getNotificationsModule = async () => {
+  try {
+    return await import('expo-notifications');
+  } catch (error) {
+    console.log('[AuthContext] Failed to load notifications module:', error);
+    return null;
+  }
+};
 
 interface AuthContextType {
   user: User | null;
@@ -28,11 +40,22 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     loadStoredAuth();
   }, []);
 
-  // Configure notification handler - delayed to prevent TurboModule crashes on iOS native builds
+  // Configure notification handler - DISABLED FOR iOS NATIVE BUILD TESTING
+  // This was causing TurboModule crashes on iOS production builds
   useEffect(() => {
-    // Delay notification handler setup to avoid crashes during app initialization
-    const timer = setTimeout(() => {
+    // Only set up notifications after user is logged in AND after a significant delay
+    // to ensure all native modules are fully initialized
+    if (!user) return;
+    
+    const timer = setTimeout(async () => {
       try {
+        console.log('[AuthContext] Setting up notification handler (delayed)...');
+        const Notifications = await getNotificationsModule();
+        if (!Notifications) {
+          console.log('[AuthContext] Notifications module not available');
+          return;
+        }
+        
         Notifications.setNotificationHandler({
           handleNotification: async () => ({
             shouldShowAlert: true,
@@ -40,14 +63,14 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
             shouldSetBadge: true,
           }),
         });
-        console.log('[AuthContext] Notification handler configured');
+        console.log('[AuthContext] Notification handler configured successfully');
       } catch (error) {
         console.log('[AuthContext] Failed to set notification handler (non-fatal):', error);
       }
-    }, 1000); // Wait 1 second after component mounts
+    }, 5000); // Wait 5 seconds after user is set to ensure app is fully initialized
     
     return () => clearTimeout(timer);
-  }, []);
+  }, [user]);
 
   // Register push notifications when user changes - with delay to not block app startup
   useEffect(() => {
@@ -71,6 +94,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       // Check if running on a real device (required for push)
       if (!Device.isDevice) {
         console.log('[AuthContext] Push notifications require a physical device - skipping');
+        return;
+      }
+
+      // Lazy load notifications module
+      const Notifications = await getNotificationsModule();
+      if (!Notifications) {
+        console.log('[AuthContext] Notifications module not available');
         return;
       }
 

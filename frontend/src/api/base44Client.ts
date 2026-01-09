@@ -19,7 +19,7 @@ const getBackendUrl = () => {
   }
   return Constants.expoConfig?.extra?.backendUrl || 
          process.env.EXPO_PUBLIC_BACKEND_URL || 
-         'https://spynner-stable.preview.emergentagent.com';
+         'https://app-recovery-spyn.preview.emergentagent.com';
 };
 
 // Storage key for auth token

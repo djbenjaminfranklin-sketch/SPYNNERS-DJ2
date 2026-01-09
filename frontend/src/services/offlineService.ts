@@ -6,10 +6,21 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import NetInfo, { NetInfoState } from '@react-native-community/netinfo';
 import * as Device from 'expo-device';
-import * as Notifications from 'expo-notifications';
+// LAZY IMPORT: expo-notifications is loaded dynamically to prevent iOS native build crashes
+// import * as Notifications from 'expo-notifications';
 import { Platform, AppState, AppStateStatus } from 'react-native';
 import axios from 'axios';
 import Constants from 'expo-constants';
+
+// Helper to get Notifications module lazily
+const getNotificationsModule = async () => {
+  try {
+    return await import('expo-notifications');
+  } catch (error) {
+    console.log('[OfflineService] Failed to load notifications module:', error);
+    return null;
+  }
+};
 
 // Get backend URL from environment or use current origin
 const getBackendUrl = () => {
@@ -27,7 +38,7 @@ const getBackendUrl = () => {
   }
   
   // Fallback
-  return 'https://spynner-stable.preview.emergentagent.com';
+  return 'https://app-recovery-spyn.preview.emergentagent.com';
 };
 
 const BACKEND_URL = getBackendUrl();
@@ -137,20 +148,8 @@ class OfflineService {
       });
     }
     
-    // Listen for app state changes (foreground/background)
-    // When app comes back to foreground, try to sync pending sessions
-    if (Platform.OS !== 'web') {
-      AppState.addEventListener('change', (nextAppState: AppStateStatus) => {
-        console.log('[Offline] App state changed to:', nextAppState);
-        if (nextAppState === 'active') {
-          // App came to foreground - check network and sync
-          console.log('[Offline] App became active - checking for pending sync...');
-          this.isOnline = true; // Assume online when app becomes active
-          this.networkChangeCallbacks.forEach(cb => cb(true));
-          this.autoSyncPendingSessions();
-        }
-      });
-    }
+    // NOTE: AppState listener removed - was causing crashes on iOS native builds
+    // The sync will happen when user manually opens the app and triggers a network request
   }
 
   private async autoSyncPendingSessions() {
@@ -200,6 +199,13 @@ class OfflineService {
         return null;
       }
 
+      // Lazy load notifications module
+      const Notifications = await getNotificationsModule();
+      if (!Notifications) {
+        console.log('[Notifications] Module not available');
+        return null;
+      }
+
       const { status: existingStatus } = await Notifications.getPermissionsAsync();
       let finalStatus = existingStatus;
 
@@ -213,9 +219,13 @@ class OfflineService {
         return null;
       }
 
-      // Get Expo push token
+      // Get Expo push token - use correct EAS projectId from Constants
+      const projectId = Constants.expoConfig?.extra?.eas?.projectId ?? 
+                       Constants.easConfig?.projectId ??
+                       'c1af0b44-03ab-45a7-9162-842db0b8c638';
+      
       const tokenData = await Notifications.getExpoPushTokenAsync({
-        projectId: '691a4d96d819355b52c063f3', // Your project ID
+        projectId,
       });
       
       const pushToken = tokenData.data;
@@ -251,15 +261,25 @@ class OfflineService {
 
   // Send local notification (for testing)
   async sendLocalNotification(title: string, body: string, data?: any) {
-    await Notifications.scheduleNotificationAsync({
-      content: {
-        title,
-        body,
-        data: data || {},
-        sound: 'default',
-      },
-      trigger: null, // Immediate
-    });
+    try {
+      const Notifications = await getNotificationsModule();
+      if (!Notifications) {
+        console.log('[Notifications] Module not available for local notification');
+        return;
+      }
+      
+      await Notifications.scheduleNotificationAsync({
+        content: {
+          title,
+          body,
+          data: data || {},
+          sound: 'default',
+        },
+        trigger: null, // Immediate
+      });
+    } catch (error) {
+      console.log('[Notifications] Failed to send local notification:', error);
+    }
   }
 
   // ==================== OFFLINE SESSION STORAGE ====================

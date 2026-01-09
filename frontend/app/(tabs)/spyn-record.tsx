@@ -57,7 +57,7 @@ const getBackendUrl = () => {
   if (Platform.OS === 'web' && typeof window !== 'undefined') {
     return window.location.origin;
   }
-  return 'https://spynner-stable.preview.emergentagent.com';
+  return 'https://app-recovery-spyn.preview.emergentagent.com';
 };
 const BACKEND_URL = getBackendUrl();
 

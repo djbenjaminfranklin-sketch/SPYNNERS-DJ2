@@ -10,7 +10,7 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.abbas.spynners",
-      "buildNumber": "29",
+      "buildNumber": "38",
       "associatedDomains": [
         "applinks:spynners.com",
         "webcredentials:spynners.com"
@@ -74,21 +74,14 @@
       ],
       "expo-font",
       "expo-secure-store",
-      "expo-web-browser",
-      [
-        "expo-notifications",
-        {
-          "icon": "./assets/images/spynners-logo.png",
-          "color": "#00D4FF"
-        }
-      ]
+      "expo-web-browser"
     ],
     "experiments": {
       "typedRoutes": true
     },
     "extra": {
       "router": {},
-      "backendUrl": "https://spynner-stable.preview.emergentagent.com",
+      "backendUrl": "https://app-recovery-spyn.preview.emergentagent.com",
       "base44AppId": "691a4d96d819355b52c063f3",
       "acrcloudHost": "identify-eu-west-1.acrcloud.com",
       "eas": {
